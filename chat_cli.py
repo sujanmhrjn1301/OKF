@@ -55,7 +55,9 @@ _EMBED_MODEL = None
 _RERANK_MODEL = None
 _ARTICLE_GRAPH: dict[str, list[int]] | None = None
 
-OKF_DIR = Path(__file__).with_name("okf_output")
+OKF_DIR = Path(__file__).resolve().parent / "data" / "okf" / "constitution"
+if not OKF_DIR.exists():
+    OKF_DIR = Path(__file__).with_name("okf_output")
 ARTICLE_GRAPH_PATH = OKF_DIR / "article_graph.json"
 
 

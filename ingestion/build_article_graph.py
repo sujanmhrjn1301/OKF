@@ -18,7 +18,8 @@ import json
 import re
 from pathlib import Path
 
-OKF_DIR = Path(__file__).with_name("okf_output")
+BASE_PROJECT_DIR = Path(__file__).resolve().parent.parent
+OKF_DIR = BASE_PROJECT_DIR / "data" / "okf" / "constitution"
 ARTICLES_DIR = OKF_DIR / "articles"
 OUTPUT_PATH = OKF_DIR / "article_graph.json"
 

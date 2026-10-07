@@ -55,7 +55,9 @@ DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 
-OKF_DIR = Path(__file__).with_name("okf_output")
+OKF_DIR = Path(__file__).resolve().parent / "data" / "okf" / "constitution"
+if not OKF_DIR.exists():
+    OKF_DIR = Path(__file__).with_name("okf_output")
 MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 TABLE_NAME = "knowledge.okf_documents"

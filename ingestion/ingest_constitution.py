@@ -42,8 +42,9 @@ except ImportError:
     )
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-PDF_PATH = Path(__file__).with_name("const.pdf")
-OUTPUT_DIR = Path(__file__).with_name("okf_output")
+BASE_PROJECT_DIR = Path(__file__).resolve().parent.parent
+PDF_PATH = BASE_PROJECT_DIR / "data" / "raw_pdf" / "const.pdf"
+OUTPUT_DIR = BASE_PROJECT_DIR / "data" / "okf" / "constitution"
 
 SOURCE_TITLE = "The Constitution of Nepal"
 SOURCE_DATE = "2015-09-20"
