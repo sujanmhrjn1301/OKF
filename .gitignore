@@ -1,0 +1,39 @@
+# Environment & Secret Credentials
+.env
+.env.*
+*.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE, Editor & OS Configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & Temporary Files
+*.log
+*.tmp
+temp/
+tmp/
+
+# Distribution & Build
+build/
+dist/
+*.egg-info/

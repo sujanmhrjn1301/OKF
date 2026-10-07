@@ -1,0 +1,30 @@
+---
+type: legal-provision
+title: Article 72 -- Remuneration and Facilities of President and Vice-President
+description: Article 72 of The Constitution of Nepal
+source: "https://www.lawcommission.gov.np"
+timestamp: "2026-10-07T07:54:46Z"
+tags:
+  - constitution
+  - nepal
+  - legal
+  - part-6
+  - president-and-vice-president
+resource: "const.pdf#article-72"
+part_number: 6
+part_title: President and Vice-President
+article_number: 72
+page: 40
+clause_count: 0
+sub_clause_count: 0
+proviso_count: 0
+---
+
+# Article 72 -- Remuneration and Facilities of President and Vice-President
+
+> **Part 6:** President and Vice-President  
+> **Page:** 40
+
+The remuneration and
+other facilities of the President and the Vice-president shall be as provided for in a
+Federal Act, and until such Act is enacted as specified by the Government of Nepal.
