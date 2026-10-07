@@ -44,10 +44,12 @@ CREATE SCHEMA IF NOT EXISTS app_users;
 CREATE SCHEMA IF NOT EXISTS user_vault;
 
 -- ============================================================================
--- GLOBAL KNOWLEDGE REPOSITORY (Constitution & OKF Documents)
+-- GLOBAL KNOWLEDGE REPOSITORY (Multi-Document Legal Knowledge Base)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS knowledge.okf_documents (
     id BIGSERIAL PRIMARY KEY,
+    source_document TEXT NOT NULL DEFAULT 'constitution',  -- 'constitution', 'penal_code', 'civil_code', etc.
+    source_title TEXT NOT NULL DEFAULT 'Constitution of Nepal, 2015',  -- Human-readable full title
     file_path TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     doc_type TEXT NOT NULL,
@@ -57,6 +59,8 @@ CREATE TABLE IF NOT EXISTS knowledge.okf_documents (
     part_number INTEGER,
     part_title TEXT,
     article_number INTEGER,
+    section_number INTEGER,          -- For statutory codes (Penal Code, Civil Code, etc.)
+    chapter_number INTEGER,          -- Chapter within the Act
     page INTEGER,
     clause_count INTEGER DEFAULT 0,
     sub_clause_count INTEGER DEFAULT 0,
@@ -67,21 +71,27 @@ CREATE TABLE IF NOT EXISTS knowledge.okf_documents (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_okf_source ON knowledge.okf_documents(source_document);
 CREATE INDEX IF NOT EXISTS idx_okf_doc_type ON knowledge.okf_documents(doc_type);
 CREATE INDEX IF NOT EXISTS idx_okf_part ON knowledge.okf_documents(part_number);
 CREATE INDEX IF NOT EXISTS idx_okf_article ON knowledge.okf_documents(article_number);
+CREATE INDEX IF NOT EXISTS idx_okf_section ON knowledge.okf_documents(section_number);
+CREATE INDEX IF NOT EXISTS idx_okf_chapter ON knowledge.okf_documents(chapter_number);
 CREATE INDEX IF NOT EXISTS idx_okf_page ON knowledge.okf_documents(page);
 
--- Hybrid search for global OKF documents
+-- Hybrid search for global OKF documents (supports multi-source filtering)
 CREATE OR REPLACE FUNCTION knowledge.match_okf_documents(
     query_embedding VECTOR(384),
     match_threshold FLOAT DEFAULT 0.3,
     match_count INT DEFAULT 10,
     filter_part_number INT DEFAULT NULL,
-    filter_doc_type TEXT DEFAULT NULL
+    filter_doc_type TEXT DEFAULT NULL,
+    filter_source TEXT DEFAULT NULL       -- 'constitution', 'penal_code', etc. NULL = search all
 )
 RETURNS TABLE (
     id BIGINT,
+    source_document TEXT,
+    source_title TEXT,
     file_path TEXT,
     chunk_index INTEGER,
     doc_type TEXT,
@@ -89,6 +99,8 @@ RETURNS TABLE (
     content TEXT,
     part_number INTEGER,
     article_number INTEGER,
+    section_number INTEGER,
+    chapter_number INTEGER,
     page INTEGER,
     clause_count INTEGER,
     sub_clause_count INTEGER,
@@ -102,6 +114,8 @@ BEGIN
     RETURN QUERY
     SELECT
         d.id,
+        d.source_document,
+        d.source_title,
         d.file_path,
         d.chunk_index,
         d.doc_type,
@@ -109,6 +123,8 @@ BEGIN
         d.content,
         d.part_number,
         d.article_number,
+        d.section_number,
+        d.chapter_number,
         d.page,
         d.clause_count,
         d.sub_clause_count,
@@ -120,6 +136,7 @@ BEGIN
         (1 - (d.embedding <=> query_embedding)) > match_threshold
         AND (filter_part_number IS NULL OR d.part_number = filter_part_number)
         AND (filter_doc_type IS NULL OR d.doc_type = filter_doc_type)
+        AND (filter_source IS NULL OR d.source_document = filter_source)
     ORDER BY d.embedding <=> query_embedding
     LIMIT match_count;
 END;
@@ -248,7 +265,7 @@ CREATE TABLE IF NOT EXISTS user_vault.chat_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES app_users.users(id) ON DELETE CASCADE,
     title TEXT NOT NULL DEFAULT 'New Conversation',
-    chat_mode VARCHAR(50) DEFAULT 'constitution', -- 'constitution' OR 'pdf_chat'
+    chat_mode VARCHAR(50) DEFAULT 'constitution', -- 'constitution', 'penal_code', 'all_laws', 'pdf_chat'
     document_id UUID REFERENCES user_vault.user_documents(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -284,7 +301,7 @@ def setup_all():
     try:
         cur.execute(SQL_SCHEMA_SETUP)
         print("\n[SUCCESS] Successfully initialized database schemas:")
-        print("  1. Schema 'knowledge'   -> okf_documents (Global Constitution Store)")
+        print("  1. Schema 'knowledge'   -> okf_documents (Multi-Document Legal Knowledge Base)")
         print("  2. Schema 'app_users'   -> users (Signup, Login, Profiles)")
         print("  3. Schema 'user_vault'  -> user_documents, user_document_chunks (Isolated User PDFs)")
         print("  4. Schema 'user_vault'  -> chat_sessions, chat_messages (User Chat History)")

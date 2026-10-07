@@ -1,14 +1,16 @@
 """
 vectorize.py -- Load OKF bundle into Supabase (pgvector) for semantic retrieval
 
-Reads  :  okf_output/  (OKF Markdown files with YAML frontmatter)
-Writes :  Supabase table `okf_documents` with vector embeddings
+Reads  :  data/okf/<source>/  (OKF Markdown files with YAML frontmatter)
+Writes :  Supabase table `knowledge.okf_documents` with vector embeddings
 
 Usage:
-  python vectorize.py                                   # full ingest
-  python vectorize.py --query "right to education"      # search
-  python vectorize.py --query "citizenship" --part 2    # filtered search
-  python vectorize.py --setup-only                      # just create table
+  python vectorize.py --source constitution              # ingest constitution
+  python vectorize.py --source penal_code                # ingest penal code
+  python vectorize.py --source all                       # ingest all sources
+  python vectorize.py --query "right to education"       # search all
+  python vectorize.py --query "definitions" --source penal_code  # filtered search
+  python vectorize.py --setup-only                       # just create table
 """
 
 from __future__ import annotations
@@ -55,13 +57,34 @@ DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 
-OKF_DIR = Path(__file__).resolve().parent / "data" / "okf" / "constitution"
-if not OKF_DIR.exists():
-    OKF_DIR = Path(__file__).with_name("okf_output")
+BASE_DIR = Path(__file__).resolve().parent
 MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 TABLE_NAME = "knowledge.okf_documents"
 BATCH_SIZE = 50
+
+# -- Source Registry ----------------------------------------------------------
+# Maps source keys to their OKF directory and human-readable title.
+# Add new entries here when you ingest a new Act/law.
+SOURCE_CONFIGS = {
+    "constitution": {
+        "dir": BASE_DIR / "data" / "okf" / "constitution",
+        "title": "Constitution of Nepal, 2015",
+    },
+    "penal_code": {
+        "dir": BASE_DIR / "data" / "okf" / "penal_code",
+        "title": "The National Criminal Procedure (Code) Act, 2017",
+    },
+}
+
+def get_okf_dir(source: str) -> Path:
+    """Resolve the OKF directory for a given source key."""
+    if source not in SOURCE_CONFIGS:
+        sys.exit(f"ERROR: Unknown source '{source}'. Available: {list(SOURCE_CONFIGS.keys())}")
+    d = SOURCE_CONFIGS[source]["dir"]
+    if not d.exists():
+        sys.exit(f"ERROR: OKF directory not found: {d}")
+    return d
 
 
 # -- Data Model --------------------------------------------------------------
@@ -80,7 +103,8 @@ class OKFDocument:
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-def parse_okf_file(filepath: Path) -> OKFDocument | None:
+def parse_okf_file(filepath: Path, okf_dir: Path | None = None) -> OKFDocument | None:
+    base = okf_dir or filepath.parent
     try:
         text = filepath.read_text(encoding="utf-8")
     except Exception as e:
@@ -99,7 +123,7 @@ def parse_okf_file(filepath: Path) -> OKFDocument | None:
     body = text[m.end():].strip()
 
     return OKFDocument(
-        file_path=str(filepath.relative_to(OKF_DIR)),
+        file_path=str(filepath.relative_to(base)),
         doc_type=meta.get("type", "unknown"),
         title=meta.get("title", filepath.stem),
         description=meta.get("description", ""),
@@ -289,16 +313,26 @@ def collect_okf_files(okf_dir: Path) -> list[Path]:
     return sorted(okf_dir.rglob("*.md"))
 
 
-def ingest(model) -> None:
-    """Full pipeline: parse -> chunk -> embed -> insert via psycopg2."""
+def ingest(model, source: str) -> None:
+    """Full pipeline: parse -> chunk -> embed -> insert via psycopg2.
+    
+    Only deletes and re-inserts data for the specified source,
+    leaving other sources untouched.
+    """
+    source_config = SOURCE_CONFIGS[source]
+    okf_dir = source_config["dir"]
+    source_title = source_config["title"]
 
-    files = collect_okf_files(OKF_DIR)
-    print(f"\n[INGEST] Found {len(files)} OKF files")
+    print(f"\n[INGEST] Source: {source} ({source_title})")
+    print(f"[INGEST] OKF Dir: {okf_dir}")
+
+    files = collect_okf_files(okf_dir)
+    print(f"[INGEST] Found {len(files)} OKF files")
 
     # Parse
     docs: list[OKFDocument] = []
     for f in files:
-        doc = parse_okf_file(f)
+        doc = parse_okf_file(f, okf_dir)
         if doc:
             doc.chunks = chunk_document(doc)
             docs.append(doc)
@@ -324,24 +358,28 @@ def ingest(model) -> None:
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Clear existing data
-    print("[INGEST] Clearing existing data...")
-    cur.execute(f"DELETE FROM {TABLE_NAME};")
+    # Clear ONLY this source's data (preserve other sources)
+    print(f"[INGEST] Clearing existing '{source}' data only...")
+    cur.execute(f"DELETE FROM {TABLE_NAME} WHERE source_document = %s;", (source,))
 
     # Prepare batch rows
     print("[INGEST] Inserting into database in batches...")
     insert_sql = f"""
         INSERT INTO {TABLE_NAME}
-            (file_path, chunk_index, doc_type, title, description,
-             content, part_number, part_title, article_number, page,
+            (source_document, source_title, file_path, chunk_index,
+             doc_type, title, description, content,
+             part_number, part_title, article_number,
+             section_number, chapter_number, page,
              clause_count, sub_clause_count, proviso_count, tags,
              metadata, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     rows = []
     for (doc, chunk_idx, chunk_text, meta), emb in zip(all_chunks_info, embeddings):
         rows.append((
+            source,
+            source_title,
             doc.file_path,
             chunk_idx,
             doc.doc_type,
@@ -351,9 +389,11 @@ def ingest(model) -> None:
             meta.get("part_number"),
             meta.get("part_title", ""),
             meta.get("article_number"),
+            meta.get("section") or meta.get("section_number"),
+            meta.get("chapter_number"),
             meta.get("page"),
             meta.get("clause_count", 0),
-            meta.get("sub_clause_count", 0),
+            meta.get("sub_clause_count", 0) or meta.get("sub_sections_count", 0),
             meta.get("proviso_count", 0),
             meta.get("tags", []),
             json.dumps(meta, default=str),
@@ -380,7 +420,7 @@ def ingest(model) -> None:
     cur.close()
     conn.close()
 
-    print(f"\n[INGEST] Done! Inserted {rows_inserted} chunks into '{TABLE_NAME}'")
+    print(f"\n[INGEST] Done! Inserted {rows_inserted} chunks for '{source}' into '{TABLE_NAME}'")
 
 
 # -- Search -------------------------------------------------------------------
@@ -389,9 +429,12 @@ def search(
     query: str,
     top_k: int = 5,
     part_number: int | None = None,
+    source: str | None = None,
 ) -> None:
     """Semantic search over the OKF vector store."""
     print(f'\nSearching: "{query}"')
+    if source:
+        print(f"  Filtering by source: {source}")
     if part_number:
         print(f"  Filtering by Part {part_number}")
     print("-" * 60)
@@ -405,14 +448,19 @@ def search(
 
     sql = f"""
         SELECT
-            id, file_path, chunk_index, doc_type, title, content,
-            part_number, article_number, page,
-            clause_count, sub_clause_count, proviso_count, tags,
+            id, source_document, source_title, file_path, chunk_index,
+            doc_type, title, content,
+            part_number, article_number, section_number, chapter_number,
+            page, clause_count, sub_clause_count, proviso_count, tags,
             (1 - (embedding <=> %s::vector)) AS similarity
         FROM {TABLE_NAME}
         WHERE (1 - (embedding <=> %s::vector)) > 0.3
     """
     params: list = [str(query_embedding), str(query_embedding)]
+
+    if source is not None:
+        sql += " AND source_document = %s"
+        params.append(source)
 
     if part_number is not None:
         sql += " AND part_number = %s"
@@ -436,14 +484,18 @@ def search(
         title = row["title"]
         page = row["page"]
         doc_type = row["doc_type"]
+        src = row["source_document"]
         art_num = row["article_number"]
+        sec_num = row["section_number"]
         clause_count = row["clause_count"]
         content_preview = row["content"][:250].replace("\n", " ")
 
         print(f"\n  [{i}] {title}")
-        print(f"      Similarity: {sim:.4f} | Type: {doc_type} | Page: {page}")
+        print(f"      Source: {src} | Similarity: {sim:.4f} | Type: {doc_type} | Page: {page}")
         if art_num:
             print(f"      Article: {art_num} | Clauses: {clause_count}")
+        if sec_num:
+            print(f"      Section: {sec_num} | Chapter: {row['chapter_number']}")
         print(f"      Preview: {content_preview}...")
 
     print()
@@ -453,7 +505,14 @@ def search(
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="OKF -> Supabase Vector Store")
+    available_sources = list(SOURCE_CONFIGS.keys())
+
+    parser = argparse.ArgumentParser(description="OKF -> Supabase Vector Store (Multi-Source)")
+    parser.add_argument(
+        "--source", "-s", type=str, default=None,
+        help=f"Source to ingest or search. Options: {available_sources + ['all']}. "
+             f"Required for ingest, optional for search (NULL = search all)."
+    )
     parser.add_argument("--query", "-q", type=str, help="Search query (skip ingest)")
     parser.add_argument("--top-k", "-k", type=int, default=5, help="Number of results")
     parser.add_argument("--part", "-p", type=int, help="Filter by part number")
@@ -461,27 +520,36 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  OKF -> Supabase pgvector")
+    print("  OKF -> Supabase pgvector (Multi-Source)")
     print("=" * 60)
+    print(f"  Available sources: {available_sources}")
 
     if args.query:
         model = load_model()
-        search(model, args.query, top_k=args.top_k, part_number=args.part)
+        search(model, args.query, top_k=args.top_k, part_number=args.part, source=args.source)
     elif args.setup_only:
         setup_database()
     else:
-        # Full pipeline: setup -> ingest -> demo search
+        # Ingest mode: --source is required
+        if not args.source:
+            sys.exit("ERROR: --source is required for ingest. Use: --source constitution, --source penal_code, or --source all")
+
         setup_database()
         model = load_model()
-        ingest(model)
 
-        # Demo searches
+        if args.source == "all":
+            for src_key in available_sources:
+                ingest(model, src_key)
+        else:
+            if args.source not in SOURCE_CONFIGS:
+                sys.exit(f"ERROR: Unknown source '{args.source}'. Available: {available_sources}")
+            ingest(model, args.source)
+
+        # Demo search across all sources
         print("\n" + "=" * 60)
-        print("  Demo Searches")
+        print("  Demo Searches (all sources)")
         print("=" * 60)
-        search(model, "right to education", top_k=3)
-        search(model, "citizenship by descent", top_k=3)
-        search(model, "freedom of speech", top_k=3)
+        search(model, "definitions", top_k=3)
 
 
 if __name__ == "__main__":
