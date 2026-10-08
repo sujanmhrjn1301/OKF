@@ -46,66 +46,88 @@ CREATE SCHEMA IF NOT EXISTS user_vault;
 -- ============================================================================
 -- GLOBAL KNOWLEDGE REPOSITORY (Multi-Document Legal Knowledge Base)
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS knowledge.okf_documents (
+-- ============================================================================
+-- GLOBAL KNOWLEDGE REPOSITORY (Two-Tier Multi-Document Legal Knowledge Base)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS knowledge.documents (
+    id TEXT PRIMARY KEY,                       -- e.g. 'constitution', 'criminal_procedure'
+    title TEXT NOT NULL,                       -- Official statutory title
+    short_title TEXT,                          -- Human-readable short title
+    doc_category TEXT NOT NULL DEFAULT 'act',  -- 'constitution', 'code', 'act', 'regulation', 'precedent'
+    status TEXT NOT NULL DEFAULT 'active',     -- 'active', 'amended', 'repealed'
+    year_bs INTEGER,                           -- Calendar year in BS (e.g. 2074)
+    year_ad INTEGER,                           -- Calendar year in AD (e.g. 2017)
+    act_number TEXT,                           -- e.g. 'Act No. 36 of 2074'
+    jurisdiction TEXT NOT NULL DEFAULT 'Nepal',
+    language TEXT NOT NULL DEFAULT 'en',       -- 'en', 'ne'
+    total_units INTEGER DEFAULT 0,
+    total_chunks INTEGER DEFAULT 0,
+    tags TEXT[] DEFAULT '{}',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge.document_chunks (
     id BIGSERIAL PRIMARY KEY,
-    source_document TEXT NOT NULL DEFAULT 'constitution',  -- 'constitution', 'penal_code', 'civil_code', etc.
-    source_title TEXT NOT NULL DEFAULT 'Constitution of Nepal, 2015',  -- Human-readable full title
+    document_id TEXT NOT NULL REFERENCES knowledge.documents(id) ON DELETE CASCADE,
     file_path TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     doc_type TEXT NOT NULL,
+    structural_ref TEXT,                       -- 'Article 18', 'Section 58', 'Schedule 1'
+    unit_number INTEGER,                       -- Numeric article or section
+    parent_number INTEGER,                     -- Part or Chapter number
+    parent_title TEXT,                         -- Part or Chapter title
     title TEXT NOT NULL,
     description TEXT,
     content TEXT NOT NULL,
-    part_number INTEGER,
-    part_title TEXT,
-    article_number INTEGER,
-    section_number INTEGER,          -- For statutory codes (Penal Code, Civil Code, etc.)
-    chapter_number INTEGER,          -- Chapter within the Act
     page INTEGER,
     clause_count INTEGER DEFAULT 0,
     sub_clause_count INTEGER DEFAULT 0,
     proviso_count INTEGER DEFAULT 0,
-    tags TEXT[],
+    tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}'::jsonb,
-    embedding VECTOR(384),
+    embedding VECTOR(1536),                    -- OpenAI text-embedding-3-small (1536 dims)
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_okf_source ON knowledge.okf_documents(source_document);
-CREATE INDEX IF NOT EXISTS idx_okf_doc_type ON knowledge.okf_documents(doc_type);
-CREATE INDEX IF NOT EXISTS idx_okf_part ON knowledge.okf_documents(part_number);
-CREATE INDEX IF NOT EXISTS idx_okf_article ON knowledge.okf_documents(article_number);
-CREATE INDEX IF NOT EXISTS idx_okf_section ON knowledge.okf_documents(section_number);
-CREATE INDEX IF NOT EXISTS idx_okf_chapter ON knowledge.okf_documents(chapter_number);
-CREATE INDEX IF NOT EXISTS idx_okf_page ON knowledge.okf_documents(page);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON knowledge.document_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_structural_ref ON knowledge.document_chunks(structural_ref);
+CREATE INDEX IF NOT EXISTS idx_chunks_unit_num ON knowledge.document_chunks(unit_number);
+CREATE INDEX IF NOT EXISTS idx_chunks_parent_num ON knowledge.document_chunks(parent_number);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_type ON knowledge.document_chunks(doc_type);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_and_type ON knowledge.document_chunks(document_id, doc_type);
 
--- Hybrid search for global OKF documents (supports multi-source filtering)
-CREATE OR REPLACE FUNCTION knowledge.match_okf_documents(
-    query_embedding VECTOR(384),
-    match_threshold FLOAT DEFAULT 0.3,
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw ON knowledge.document_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Unified Multi-Document Retrieval RPC
+CREATE OR REPLACE FUNCTION knowledge.match_documents(
+    query_embedding VECTOR(1536),
+    match_threshold FLOAT DEFAULT 0.25,
     match_count INT DEFAULT 10,
-    filter_part_number INT DEFAULT NULL,
+    filter_document_id TEXT DEFAULT NULL,
+    filter_doc_category TEXT DEFAULT NULL,
     filter_doc_type TEXT DEFAULT NULL,
-    filter_source TEXT DEFAULT NULL       -- 'constitution', 'penal_code', etc. NULL = search all
+    filter_unit_number INT DEFAULT NULL
 )
 RETURNS TABLE (
     id BIGINT,
-    source_document TEXT,
-    source_title TEXT,
-    file_path TEXT,
-    chunk_index INTEGER,
+    document_id TEXT,
+    document_title TEXT,
+    doc_category TEXT,
+    structural_ref TEXT,
+    unit_number INTEGER,
+    parent_number INTEGER,
+    parent_title TEXT,
     doc_type TEXT,
     title TEXT,
     content TEXT,
-    part_number INTEGER,
-    article_number INTEGER,
-    section_number INTEGER,
-    chapter_number INTEGER,
+    file_path TEXT,
     page INTEGER,
-    clause_count INTEGER,
-    sub_clause_count INTEGER,
-    proviso_count INTEGER,
     tags TEXT[],
+    metadata JSONB,
     similarity FLOAT
 )
 LANGUAGE plpgsql
@@ -113,31 +135,31 @@ AS $$
 BEGIN
     RETURN QUERY
     SELECT
-        d.id,
-        d.source_document,
-        d.source_title,
-        d.file_path,
-        d.chunk_index,
-        d.doc_type,
-        d.title,
-        d.content,
-        d.part_number,
-        d.article_number,
-        d.section_number,
-        d.chapter_number,
-        d.page,
-        d.clause_count,
-        d.sub_clause_count,
-        d.proviso_count,
-        d.tags,
-        (1 - (d.embedding <=> query_embedding))::FLOAT AS similarity
-    FROM knowledge.okf_documents d
+        c.id,
+        c.document_id,
+        d.title AS document_title,
+        d.doc_category,
+        c.structural_ref,
+        c.unit_number,
+        c.parent_number,
+        c.parent_title,
+        c.doc_type,
+        c.title,
+        c.content,
+        c.file_path,
+        c.page,
+        c.tags,
+        c.metadata,
+        (1 - (c.embedding <=> query_embedding))::FLOAT AS similarity
+    FROM knowledge.document_chunks c
+    JOIN knowledge.documents d ON c.document_id = d.id
     WHERE
-        (1 - (d.embedding <=> query_embedding)) > match_threshold
-        AND (filter_part_number IS NULL OR d.part_number = filter_part_number)
-        AND (filter_doc_type IS NULL OR d.doc_type = filter_doc_type)
-        AND (filter_source IS NULL OR d.source_document = filter_source)
-    ORDER BY d.embedding <=> query_embedding
+        (1 - (c.embedding <=> query_embedding)) > match_threshold
+        AND (filter_document_id IS NULL OR c.document_id = filter_document_id)
+        AND (filter_doc_category IS NULL OR d.doc_category = filter_doc_category)
+        AND (filter_doc_type IS NULL OR c.doc_type = filter_doc_type)
+        AND (filter_unit_number IS NULL OR c.unit_number = filter_unit_number)
+    ORDER BY c.embedding <=> query_embedding
     LIMIT match_count;
 END;
 $$;
@@ -265,7 +287,7 @@ CREATE TABLE IF NOT EXISTS user_vault.chat_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES app_users.users(id) ON DELETE CASCADE,
     title TEXT NOT NULL DEFAULT 'New Conversation',
-    chat_mode VARCHAR(50) DEFAULT 'constitution', -- 'constitution', 'penal_code', 'all_laws', 'pdf_chat'
+    chat_mode VARCHAR(50) DEFAULT 'constitution', -- 'constitution', 'criminal_procedure', 'all_laws', 'pdf_chat'
     document_id UUID REFERENCES user_vault.user_documents(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
