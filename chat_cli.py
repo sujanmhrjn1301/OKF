@@ -1,18 +1,19 @@
 """
-chat_cli.py -- Interactive Terminal Legal AI Chat Engine (v2)
+chat_cli.py -- Interactive Terminal Legal AI Chat Engine (v3 - Multi-Document & Two-Tier RAG)
 
 5-Layer Scenario-Aware Retrieval Architecture:
-  Layer 1: Query Intent Classifier (CONSTITUTIONAL_DIRECT / SCENARIO / STATUTORY / MIXED)
-  Layer 2: Multi-Query Decomposition (3 diverse sub-queries per scenario)
-  Layer 3: Enhanced Hybrid Search + Article Cross-Reference Graph Expansion
-  Layer 4: Scenario-Aware Reranking (intent-boosted cross-encoder)
-  Layer 5: Domain-Aware Dynamic Prompt Assembly
+  Layer 1: Query Intent Classifier (CONSTITUTIONAL_DIRECT / SCENARIO / STATUTORY_CRIMINAL / MIXED)
+  Layer 2: Multi-Query Decomposition (Rights, Remedies, Procedural angles)
+  Layer 3: Multi-Document Vector Retrieval across Two-Tier Supabase (Constitution + Criminal Procedure)
+  Layer 4: Scenario-Aware Cross-Encoder Reranking
+  Layer 5: Domain-Aware Dynamic Prompt Assembly (FIRAC framework & statutory analysis)
 
-Also includes:
-  - User Signup & Login with password hashing & field validation
-  - Isolated Chat Sessions & History stored in user_vault schema
+Features:
+  - Supports All Laws, Criminal Procedure Code (2017), and Constitution of Nepal (2015)
+  - Uses OpenRouter openai/text-embedding-3-small (1536-dim vectors, zero PyTorch load time)
+  - User Authentication & isolated Chat Sessions (user_vault schema)
   - Real-time streaming via OpenRouter (Llama 3.3 70B)
-  - Verified Article, Clause, and Page Number Citations
+  - Verified Article, Section, Clause, and Page Number Citations
 """
 
 from __future__ import annotations
@@ -42,43 +43,55 @@ import auth_service
 # Load environment
 load_dotenv(Path(__file__).with_name(".env"))
 
-hf_token = os.getenv("HF_TOKEN", "")
-if hf_token:
-    os.environ["HF_TOKEN"] = hf_token
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
 
 # Global model caches
-_EMBED_MODEL = None
 _RERANK_MODEL = None
 _ARTICLE_GRAPH: dict[str, list[int]] | None = None
 
-OKF_DIR = Path(__file__).resolve().parent / "data" / "okf" / "constitution"
-if not OKF_DIR.exists():
-    OKF_DIR = Path(__file__).with_name("okf_output")
-ARTICLE_GRAPH_PATH = OKF_DIR / "article_graph.json"
+BASE_DIR = Path(__file__).resolve().parent
+CONSTITUTION_DIR = BASE_DIR / "data" / "okf" / "constitution"
+CRIMINAL_PROC_DIR = BASE_DIR / "data" / "okf" / "criminal_procedure"
+ARTICLE_GRAPH_PATH = CONSTITUTION_DIR / "article_graph.json"
 
 
-def get_embed_model():
-    global _EMBED_MODEL
-    if _EMBED_MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        _EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    return _EMBED_MODEL
+def get_query_embedding(text: str) -> list[float]:
+    """Generate 1536-dim embedding for query via OpenRouter API."""
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY is missing in .env file.")
+
+    url = "https://openrouter.ai/api/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "input": text,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    if resp.status_code == 200:
+        return resp.json()["data"][0]["embedding"]
+    raise RuntimeError(f"Embedding failed ({resp.status_code}): {resp.text}")
 
 
 def get_rerank_model():
+    """Lazy-load cross-encoder reranker."""
     global _RERANK_MODEL
     if _RERANK_MODEL is None:
-        from sentence_transformers import CrossEncoder
-        _RERANK_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        try:
+            from sentence_transformers import CrossEncoder
+            _RERANK_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception as e:
+            # If cross-encoder fails to load, gracefully fall back to similarity ranking
+            _RERANK_MODEL = None
     return _RERANK_MODEL
 
 
 def get_article_graph() -> dict[str, list[int]]:
-    """Load the pre-built article cross-reference graph from JSON."""
+    """Load the pre-built constitutional article cross-reference graph from JSON."""
     global _ARTICLE_GRAPH
     if _ARTICLE_GRAPH is None:
         if ARTICLE_GRAPH_PATH.exists():
@@ -95,26 +108,21 @@ def get_article_graph() -> dict[str, list[int]]:
 # LAYER 1: Query Intent Classifier
 # ============================================================================
 
-# Valid intent categories
 INTENT_CATEGORIES = {
     "CONSTITUTIONAL_DIRECT",
     "CONSTITUTIONAL_SCENARIO",
-    "STATUTORY_CIVIL",
     "STATUTORY_CRIMINAL",
+    "STATUTORY_CIVIL",
     "MIXED",
 }
 
 
 def classify_query_intent(query: str) -> dict[str, Any]:
-    """Classify the query's legal domain and intent using a fast LLM call.
-
-    Returns:
-        dict with keys: intent, reasoning, suggested_articles
-    """
+    """Classify the query's legal domain and intent using OpenRouter."""
     default_result = {
-        "intent": "CONSTITUTIONAL_DIRECT",
-        "reasoning": "Default classification",
-        "suggested_articles": [],
+        "intent": "MIXED",
+        "reasoning": "General legal inquiry",
+        "suggested_provisions": [],
     }
 
     if not OPENROUTER_API_KEY:
@@ -127,23 +135,15 @@ def classify_query_intent(query: str) -> dict[str, Any]:
             "Content-Type": "application/json",
         }
         prompt = (
-            "You are a Nepali Legal Domain Classifier.\n"
-            "Classify the user's query into exactly ONE of these categories:\n\n"
-            "- CONSTITUTIONAL_DIRECT: Direct question about the Constitution of Nepal "
-            "(eligibility, term limits, structure, powers, fundamental rights definitions).\n"
-            "- CONSTITUTIONAL_SCENARIO: A real-world scenario/story where constitutional "
-            "fundamental rights are the PRIMARY governing law (e.g., discrimination by state, "
-            "denial of citizenship, state censorship, forced labor by state).\n"
-            "- STATUTORY_CIVIL: A private dispute between citizens best resolved under statutory "
-            "law like Muluki Civil Code, 2074 (property boundary disputes, contract disputes, "
-            "inheritance, adverse possession, tenancy, private trespass).\n"
-            "- STATUTORY_CRIMINAL: A criminal matter under Muluki Criminal Code "
-            "(theft, assault, fraud, murder, domestic violence).\n"
-            "- MIXED: Has BOTH constitutional AND statutory dimensions "
-            "(e.g., state-involved land acquisition, police brutality + criminal complaint).\n\n"
-            "Also suggest 2-4 specific Article numbers from Nepal's Constitution that are most relevant.\n\n"
-            "Respond in this EXACT JSON format and nothing else:\n"
-            '{"intent": "CATEGORY_NAME", "reasoning": "one sentence why", "suggested_articles": [25, 46]}\n\n'
+            "You are a Senior Legal Domain Classifier for Nepal Law (Constitution of Nepal, 2015 and National Criminal Procedure Code, 2017).\n"
+            "Classify the user's query into exactly ONE category:\n\n"
+            "- CONSTITUTIONAL_DIRECT: Direct question about the Constitution of Nepal.\n"
+            "- CONSTITUTIONAL_SCENARIO: Real-world scenario where Constitutional Fundamental Rights (Part 3) are primary.\n"
+            "- STATUTORY_CRIMINAL: Criminal procedural matter (arrest, detention, remand, search, seizure, bail, charge-sheet, trial, evidence, appeal).\n"
+            "- STATUTORY_CIVIL: Private civil dispute (property, contract, family, tenancy).\n"
+            "- MIXED: Involves BOTH constitutional rights (e.g., Article 20 justice, Article 23 preventive detention) AND criminal procedure (e.g., Section 14, 18, 19, 72).\n\n"
+            "Respond in this EXACT JSON format:\n"
+            '{"intent": "CATEGORY_NAME", "reasoning": "brief why", "suggested_provisions": ["Section 14", "Article 20"]}\n\n'
             f'User query: "{query}"'
         )
         payload = {
@@ -155,13 +155,11 @@ def classify_query_intent(query: str) -> dict[str, Any]:
         resp = requests.post(url, headers=headers, json=payload, timeout=8)
         if resp.status_code == 200:
             raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Extract JSON from response (handle markdown code fences)
             json_match = re.search(r'\{.*\}', raw, re.DOTALL)
             if json_match:
                 result = json.loads(json_match.group())
-                # Validate intent
                 if result.get("intent") not in INTENT_CATEGORIES:
-                    result["intent"] = "CONSTITUTIONAL_DIRECT"
+                    result["intent"] = "MIXED"
                 return result
     except Exception:
         pass
@@ -174,45 +172,26 @@ def classify_query_intent(query: str) -> dict[str, Any]:
 # ============================================================================
 
 def decompose_query(query: str, intent: dict[str, Any]) -> list[str]:
-    """Generate 3 diverse sub-queries targeting different retrieval angles.
+    """Generate 3 diverse sub-queries targeting different legal angles."""
+    intent_type = intent.get("intent", "MIXED")
 
-    For direct questions, returns the original query plus 1 expansion.
-    For scenarios, returns 3 distinct sub-queries.
-    """
     if not OPENROUTER_API_KEY:
         return [query]
 
-    intent_type = intent.get("intent", "CONSTITUTIONAL_DIRECT")
-
-    # Direct questions don't need heavy decomposition
-    if intent_type == "CONSTITUTIONAL_DIRECT":
-        return _simple_expand(query)
-
-    # Scenarios and mixed queries get full 3-angle decomposition
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         }
-
-        suggested_arts = intent.get("suggested_articles", [])
-        arts_hint = f"Potentially relevant articles: {suggested_arts}" if suggested_arts else ""
-
         prompt = (
-            "You are a Nepali Legal Search Query Decomposer.\n"
-            f"Query type: {intent_type}\n"
-            f"{arts_hint}\n\n"
-            "Given the user's legal query/scenario below, generate EXACTLY 3 diverse search sub-queries "
-            "that together cover all retrieval angles:\n\n"
-            "1. RIGHTS QUERY: Target the specific constitutional fundamental rights/articles "
-            "(e.g., 'Article 25 right to property protection from unlawful encroachment').\n"
-            "2. REMEDY QUERY: Target the constitutional remedy pathway "
-            "(e.g., 'Article 46 constitutional remedies Article 133 Supreme Court writ jurisdiction').\n"
-            "3. PROCEDURAL QUERY: Target the practical/procedural dimension "
-            "(e.g., 'land registration Kitta boundary demarcation survey District Court civil suit').\n\n"
-            "Each sub-query should be 10-20 words of formal legal keywords.\n"
-            "Respond as a JSON array of exactly 3 strings, nothing else.\n\n"
+            "You are a Nepali Legal Search Query Decomposer for vector search over Nepali statutes.\n"
+            f"Query type: {intent_type}\n\n"
+            "Generate EXACTLY 3 diverse search sub-queries covering all legal angles:\n"
+            "1. STATUTORY/PROCEDURAL QUERY: Target specific statutory rules (e.g., 'Section 14 24-hour presentation detention remand' or 'Section 18 19 search residence witness').\n"
+            "2. RIGHTS/CONSTITUTIONAL QUERY: Target governing rights/safeguards (e.g., 'Article 20 right to justice right against arbitrary detention').\n"
+            "3. LEGAL DOCTRINE/PRACTICE QUERY: Target practical legal requirements and procedural defects.\n\n"
+            "Respond as a JSON array of exactly 3 strings (10-15 keywords each), nothing else.\n"
             f'User query: "{query}"'
         )
         payload = {
@@ -224,91 +203,70 @@ def decompose_query(query: str, intent: dict[str, Any]) -> list[str]:
         resp = requests.post(url, headers=headers, json=payload, timeout=8)
         if resp.status_code == 200:
             raw = resp.json()["choices"][0]["message"]["content"].strip()
-            # Extract JSON array
             arr_match = re.search(r'\[.*\]', raw, re.DOTALL)
             if arr_match:
                 sub_queries = json.loads(arr_match.group())
                 if isinstance(sub_queries, list) and len(sub_queries) >= 2:
-                    # Always include original query as well
                     return [query] + [str(sq) for sq in sub_queries[:3]]
     except Exception:
         pass
 
-    # Fallback: simple expansion
-    return _simple_expand(query)
-
-
-def _simple_expand(query: str) -> list[str]:
-    """Fallback: single expanded query (equivalent to old expand_query)."""
-    if not OPENROUTER_API_KEY:
-        return [query]
-    try:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        prompt = (
-            "You are a Senior Constitutional & Legal Analyst for Nepal.\n"
-            "Analyze the user's input. It may be a direct constitutional question OR a real-world factual scenario.\n"
-            "TASK: Identify the core legal issues, the governing Constitutional Articles/Rights, and statutory legal doctrines under Nepali law.\n"
-            "Output 4 to 6 formal legal search terms and governing Articles.\n"
-            "Output ONLY the comma-separated legal terms on one line, nothing else.\n"
-            f"User input: '{query}'"
-        )
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 60,
-            "temperature": 0.0,
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=6)
-        if resp.status_code == 200:
-            expanded = resp.json()["choices"][0]["message"]["content"].strip()
-            expanded = re.sub(r'["\n]', ' ', expanded).strip()
-            return [query, f"{query} {expanded}"]
-    except Exception:
-        pass
     return [query]
 
 
 # ============================================================================
-# LAYER 3: Hybrid Retrieval + Article Cross-Reference Graph Expansion
+# LAYER 3: Two-Tier Multi-Document Retrieval
 # ============================================================================
 
-def retrieve_hybrid_candidates(query: str, expanded_terms: str, top_k: int = 15) -> list[dict[str, Any]]:
-    """Retrieve top candidates using PostgreSQL Full-Text Search (BM25) + Vector Cosine with RRF."""
-    model = get_embed_model()
-    query_emb = model.encode([query], normalize_embeddings=True).tolist()[0]
+# ============================================================================
+# LAYER 3: Two-Tier Multi-Document Retrieval (Hybrid + Targeted Metadata)
+# ============================================================================
+
+def extract_explicit_mentions(text: str, suggested: list[str]) -> tuple[list[int], list[int]]:
+    """Extract explicit Section and Article numbers from prompt and classifier output."""
+    combined = text + " " + " ".join(suggested)
+    sec_nums = sorted(list(set(map(int, re.findall(r"(?:Section|Sec\.)\s*(\d+)", combined, re.IGNORECASE)))))
+    art_nums = sorted(list(set(map(int, re.findall(r"(?:Article|Art\.)\s*(\d+)", combined, re.IGNORECASE)))))
+    return sec_nums, art_nums
+
+
+def retrieve_exact_provisions(sections: list[int], articles: list[int]) -> list[dict[str, Any]]:
+    """Directly fetch explicit Section and Article chunks with top priority."""
+    if not sections and not articles:
+        return []
 
     conn = auth_service.get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    search_text = f"{query} {expanded_terms}".replace("'", "").strip()
-
-    sql = """
-        SELECT *
-        FROM knowledge.hybrid_search_okf(
-            query_text => %s,
-            query_embedding => %s::vector,
-            match_count => %s,
-            rrf_k => 60
-        );
-    """
+    results = []
     try:
-        cur.execute(sql, (search_text, str(query_emb), top_k))
-        rows = cur.fetchall()
-        results = [dict(r) for r in rows]
-    except Exception:
-        # Fallback to standard vector search if stored procedure is unavailable
-        fallback_sql = """
-            SELECT *, (1 - (embedding <=> %s::vector)) AS rrf_score
-            FROM knowledge.okf_documents
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s;
+        conditions = []
+        params: list[Any] = []
+        if sections:
+            conditions.append("(c.document_id = 'criminal_procedure' AND c.unit_number = ANY(%s))")
+            params.append(sections)
+        if articles:
+            conditions.append("(c.document_id = 'constitution' AND c.unit_number = ANY(%s))")
+            params.append(articles)
+
+        where_clause = " OR ".join(conditions)
+        sql = f"""
+            SELECT
+                c.id, c.document_id, d.title AS document_title, d.doc_category,
+                c.structural_ref, c.unit_number, c.parent_number, c.parent_title,
+                c.doc_type, c.title, c.content, c.file_path, c.page,
+                c.clause_count, c.sub_clause_count, c.proviso_count, c.tags,
+                1.0::FLOAT AS similarity,
+                1.0::FLOAT AS rrf_score,
+                TRUE AS is_exact_match
+            FROM knowledge.document_chunks c
+            JOIN knowledge.documents d ON c.document_id = d.id
+            WHERE {where_clause}
+            ORDER BY c.document_id, c.unit_number, c.chunk_index;
         """
-        cur.execute(fallback_sql, (str(query_emb), str(query_emb), top_k))
+        cur.execute(sql, params)
         results = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"  [EXACT PROVISION RETRIEVAL ERROR] {e}")
     finally:
         cur.close()
         conn.close()
@@ -316,12 +274,96 @@ def retrieve_hybrid_candidates(query: str, expanded_terms: str, top_k: int = 15)
     return results
 
 
-def retrieve_multi_query(sub_queries: list[str], top_k_per_query: int = 10) -> list[dict[str, Any]]:
-    """Run hybrid retrieval for each sub-query, then merge and deduplicate by document ID."""
+def retrieve_hybrid_candidates(
+    query: str,
+    top_k: int = 15,
+    document_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve candidates combining 1536-dim dense cosine similarity and lexical token matching."""
+    query_emb = get_query_embedding(query)
+
+    conn = auth_service.get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    # Extract target number if query specifically references Section/Article X
+    tokens = re.findall(r"(?:Section|Article|Sec\.|Art\.)?\s*(\d+)", query, re.IGNORECASE)
+    sec_num = int(tokens[0]) if tokens and tokens[0].isdigit() else None
+
+    sql = """
+        SELECT
+            c.id,
+            c.document_id,
+            d.title AS document_title,
+            d.doc_category,
+            c.structural_ref,
+            c.unit_number,
+            c.parent_number,
+            c.parent_title,
+            c.doc_type,
+            c.title,
+            c.content,
+            c.file_path,
+            c.page,
+            c.clause_count,
+            c.sub_clause_count,
+            c.proviso_count,
+            c.tags,
+            (1 - (c.embedding <=> %s::vector))::FLOAT AS similarity,
+            (
+                (1 - (c.embedding <=> %s::vector)) +
+                CASE 
+                    WHEN %s::INT IS NOT NULL AND c.unit_number = %s::INT THEN 0.35
+                    ELSE 0.0
+                END
+            )::FLOAT AS rrf_score
+        FROM knowledge.document_chunks c
+        JOIN knowledge.documents d ON c.document_id = d.id
+        WHERE (1 - (c.embedding <=> %s::vector)) > 0.18
+           OR (%s::INT IS NOT NULL AND c.unit_number = %s::INT)
+    """
+    params: list[Any] = [str(query_emb), str(query_emb), sec_num, sec_num, str(query_emb), sec_num, sec_num]
+
+    if document_id and document_id != "all_laws":
+        sql += " AND c.document_id = %s"
+        params.append(document_id)
+
+    sql += " ORDER BY rrf_score DESC LIMIT %s;"
+    params.append(top_k)
+
+    try:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        results = [dict(r) for r in rows]
+    except Exception as e:
+        print(f"  [RETRIEVAL ERROR] {e}")
+        results = []
+    finally:
+        cur.close()
+        conn.close()
+
+    return results
+
+
+def retrieve_multi_query(
+    sub_queries: list[str],
+    top_k_per_query: int = 10,
+    document_id: str | None = None,
+    user_prompt: str = "",
+    suggested_provisions: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Run retrieval with targeted exact-provision pre-fetching and sub-query deduplication."""
     all_candidates: dict[int, dict[str, Any]] = {}
 
+    # 1. Direct Metadata Provision Retrieval (Targeted Injection)
+    sec_nums, art_nums = extract_explicit_mentions(user_prompt, suggested_provisions or [])
+    if sec_nums or art_nums:
+        exact_chunks = retrieve_exact_provisions(sec_nums, art_nums)
+        for ec in exact_chunks:
+            all_candidates[ec["id"]] = ec
+
+    # 2. Hybrid vector search across decomposed sub-queries
     for sq in sub_queries:
-        candidates = retrieve_hybrid_candidates(sq, sq, top_k=top_k_per_query)
+        candidates = retrieve_hybrid_candidates(sq, top_k=top_k_per_query, document_id=document_id)
         for c in candidates:
             doc_id = c.get("id")
             if doc_id is not None:
@@ -330,82 +372,73 @@ def retrieve_multi_query(sub_queries: list[str], top_k_per_query: int = 10) -> l
                     c["retrieval_count"] = 1
                     all_candidates[doc_id] = c
                 else:
-                    # Boost score for documents found by multiple sub-queries
                     existing["retrieval_count"] = existing.get("retrieval_count", 1) + 1
                     existing_score = existing.get("rrf_score", 0)
                     new_score = c.get("rrf_score", 0)
                     if new_score > existing_score:
                         existing["rrf_score"] = new_score
 
-    # Sort by (retrieval_count DESC, rrf_score DESC)
-    merged = sorted(
+    # Sort with exact matches guaranteed at top
+    sorted_candidates = sorted(
         all_candidates.values(),
-        key=lambda x: (x.get("retrieval_count", 1), x.get("rrf_score", 0)),
+        key=lambda x: (
+            1 if x.get("is_exact_match") else 0,
+            x.get("retrieval_count", 1),
+            x.get("rrf_score", 0),
+        ),
         reverse=True,
     )
-    return merged
+    return sorted_candidates
 
 
-def expand_with_cross_references(
-    candidates: list[dict[str, Any]],
-    intent: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Expand retrieved candidates by pulling in cross-referenced articles from the graph.
-
-    Also pulls in articles suggested by the intent classifier.
-    """
+def expand_with_cross_references(candidates: list[dict[str, Any]], intent: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand retrieved Constitutional provisions with their cross-referenced articles."""
     graph = get_article_graph()
+    if not graph:
+        return candidates
 
-    # Collect already-retrieved article numbers
     retrieved_articles = set()
     for c in candidates:
-        art = c.get("article_number")
-        if art:
-            retrieved_articles.add(art)
+        if c.get("document_id") == "constitution":
+            art_num = c.get("unit_number")
+            if art_num:
+                retrieved_articles.add(art_num)
 
-    # Find cross-referenced articles not yet retrieved
-    articles_to_fetch: set[int] = set()
-
-    # From graph (articles referenced inside the text of retrieved articles)
-    for art_num in list(retrieved_articles):
-        refs = graph.get(str(art_num), [])
-        for ref in refs:
-            if ref not in retrieved_articles:
-                articles_to_fetch.add(ref)
-
-    # From intent classifier's suggested articles
-    for art_num in intent.get("suggested_articles", []):
-        if isinstance(art_num, int) and art_num not in retrieved_articles:
-            articles_to_fetch.add(art_num)
+    articles_to_fetch = set()
+    for art in retrieved_articles:
+        neighbors = graph.get(str(art), [])
+        for neighbor in neighbors[:2]:
+            if neighbor not in retrieved_articles:
+                articles_to_fetch.add(neighbor)
 
     if not articles_to_fetch:
         return candidates
 
-    # Fetch these articles from the database
     conn = auth_service.get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        # Get the first chunk (chunk_index=0) for each cross-referenced article
         placeholders = ",".join(["%s"] * len(articles_to_fetch))
         sql = f"""
-            SELECT DISTINCT ON (article_number)
-                id, file_path, chunk_index, doc_type, title, content,
-                part_number, part_title, article_number, page,
-                clause_count, sub_clause_count, proviso_count, tags
-            FROM knowledge.okf_documents
-            WHERE article_number IN ({placeholders})
-            ORDER BY article_number, chunk_index
+            SELECT DISTINCT ON (c.unit_number)
+                c.id, c.document_id, d.title AS document_title, d.doc_category,
+                c.file_path, c.chunk_index, c.doc_type, c.structural_ref,
+                c.title, c.content, c.parent_number, c.parent_title,
+                c.unit_number, c.page, c.clause_count, c.sub_clause_count,
+                c.proviso_count, c.tags
+            FROM knowledge.document_chunks c
+            JOIN knowledge.documents d ON c.document_id = d.id
+            WHERE c.document_id = 'constitution' AND c.unit_number IN ({placeholders})
+            ORDER BY c.unit_number, c.chunk_index;
         """
         cur.execute(sql, list(articles_to_fetch))
         cross_ref_rows = cur.fetchall()
 
         for row in cross_ref_rows:
             entry = dict(row)
-            entry["rrf_score"] = 0.005  # Low score -- will be reranked
+            entry["rrf_score"] = 0.005
             entry["retrieval_count"] = 0
             entry["is_cross_ref"] = True
             candidates.append(entry)
-
     except Exception:
         pass
     finally:
@@ -416,10 +449,9 @@ def expand_with_cross_references(
 
 
 # ============================================================================
-# LAYER 4: Scenario-Aware Reranking
+# LAYER 4: Scenario-Aware Reranking (Source Diversity & Quota Enforcement)
 # ============================================================================
 
-# Part 3 articles are fundamental rights (most relevant for scenarios)
 FUNDAMENTAL_RIGHTS_PART = 3
 REMEDY_ARTICLES = {46, 133, 144}
 
@@ -428,65 +460,91 @@ def rerank_candidates(
     query: str,
     candidates: list[dict[str, Any]],
     intent: dict[str, Any],
-    top_k: int = 5,
+    top_k: int = 8,
 ) -> list[dict[str, Any]]:
-    """Rerank candidates using a Cross-Encoder with intent-aware scoring boosts.
-
-    For scenarios: boosts Part 3 (fundamental rights) and remedy articles.
-    For direct questions: uses top_k=3 (tighter).
-    """
+    """Rerank candidates using Cross-Encoder with legal boosting and source diversity quotas."""
     if not candidates:
         return []
 
-    intent_type = intent.get("intent", "CONSTITUTIONAL_DIRECT")
+    intent_type = intent.get("intent", "MIXED")
+    reranker = get_rerank_model()
 
-    # Adjust top_k based on query type
-    if intent_type == "CONSTITUTIONAL_DIRECT":
-        top_k = min(top_k, 3)
-    elif intent_type in ("CONSTITUTIONAL_SCENARIO", "MIXED"):
-        top_k = max(top_k, 5)
-    elif intent_type in ("STATUTORY_CIVIL", "STATUTORY_CRIMINAL"):
-        top_k = max(top_k, 4)
+    if reranker is not None:
+        try:
+            pairs = [(query, c.get("content", "")) for c in candidates]
+            scores = reranker.predict(pairs)
 
-    if len(candidates) <= top_k:
-        return candidates
+            for c, score in zip(candidates, scores):
+                base_score = float(score)
 
-    try:
-        reranker = get_rerank_model()
-        pairs = [(query, c.get("content", "")) for c in candidates]
-        scores = reranker.predict(pairs)
+                # 1. Exact provision matches get highest priority
+                if c.get("is_exact_match"):
+                    base_score += 4.0
 
-        for c, score in zip(candidates, scores):
-            base_score = float(score)
-
-            # Intent-aware boosting
-            if intent_type in ("CONSTITUTIONAL_SCENARIO", "MIXED"):
-                art_num = c.get("article_number")
-                part_num = c.get("part_number")
-
-                # Boost fundamental rights articles
-                if part_num == FUNDAMENTAL_RIGHTS_PART:
-                    base_score += 1.5
-
-                # Boost remedy chain articles
-                if art_num in REMEDY_ARTICLES:
+                # 2. Boost procedural criminal code chunks when query is statutory/mixed
+                if intent_type in ("STATUTORY_CRIMINAL", "MIXED") and c.get("document_id") == "criminal_procedure":
                     base_score += 2.0
 
-                # Boost articles found by multiple sub-queries
-                retrieval_count = c.get("retrieval_count", 1)
-                if retrieval_count >= 2:
+                # 3. Boost constitutional fundamental rights
+                if c.get("document_id") == "constitution" and c.get("parent_number") == FUNDAMENTAL_RIGHTS_PART:
                     base_score += 1.0
 
-                # Boost cross-referenced articles (they were pulled in for a reason)
-                if c.get("is_cross_ref"):
-                    base_score += 0.5
+                # 4. Boost constitutional remedies
+                if c.get("unit_number") in REMEDY_ARTICLES and c.get("document_id") == "constitution":
+                    base_score += 1.5
 
-            c["rerank_score"] = base_score
+                # 5. Multi-query agreement boost
+                if c.get("retrieval_count", 1) >= 2:
+                    base_score += 1.0
 
-        ranked = sorted(candidates, key=lambda x: x.get("rerank_score", 0), reverse=True)
-        return ranked[:top_k]
-    except Exception:
-        return candidates[:top_k]
+                c["rerank_score"] = base_score
+        except Exception:
+            for c in candidates:
+                c["rerank_score"] = c.get("rrf_score", 0) + (4.0 if c.get("is_exact_match") else 0.0)
+    else:
+        for c in candidates:
+            c["rerank_score"] = c.get("rrf_score", 0) + (4.0 if c.get("is_exact_match") else 0.0)
+
+    # Sort all candidates
+    ranked = sorted(candidates, key=lambda x: x.get("rerank_score", 0), reverse=True)
+
+    # Deduplicate provisions by (document_id, unit_number) so one section's chunks don't starve others
+    def deduplicate_provisions(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen = set()
+        for item in pool:
+            u = item.get("unit_number")
+            if u is not None and u in seen:
+                continue
+            if u is not None:
+                seen.add(u)
+            unique.append(item)
+        return unique
+
+    # Enforce Source Diversity / Quota
+    # When query is statutory criminal or mixed, guarantee at least 50% statutory slots
+    if intent_type in ("STATUTORY_CRIMINAL", "MIXED"):
+        statutory_pool = deduplicate_provisions([c for c in ranked if c.get("document_id") == "criminal_procedure"])
+        constitutional_pool = deduplicate_provisions([c for c in ranked if c.get("document_id") == "constitution"])
+
+        selected: list[dict[str, Any]] = []
+        # Take top 5 distinct statutory provisions (e.g. Sections 14, 18, 19...)
+        selected.extend(statutory_pool[:5])
+        # Take top 3 distinct constitutional provisions (e.g. Articles 20, 23...)
+        selected.extend(constitutional_pool[:3])
+
+        # Fill any remaining slots up to top_k with remaining unique candidates
+        seen_keys = {f"{c.get('document_id')}:{c.get('unit_number')}" for c in selected}
+        for c in ranked:
+            key = f"{c.get('document_id')}:{c.get('unit_number')}"
+            if key not in seen_keys and len(selected) < top_k:
+                selected.append(c)
+                seen_keys.add(key)
+
+        return selected[:top_k]
+    else:
+        unique_ranked = deduplicate_provisions(ranked)
+        return unique_ranked[:top_k]
 
 
 # ============================================================================
@@ -494,17 +552,25 @@ def rerank_candidates(
 # ============================================================================
 
 def hydrate_parent_context(child_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Hydrate child chunks with their full Parent Article markdown for comprehensive legal analysis."""
+    """Hydrate child chunks with full markdown provision if available."""
     hydrated = []
-    seen_articles = set()
+    seen_units = set()
 
     for chunk in child_chunks:
-        art_num = chunk.get("article_number")
+        doc_id = chunk.get("document_id")
+        unit_num = chunk.get("unit_number")
+        key = f"{doc_id}:{unit_num}"
 
-        if art_num and art_num not in seen_articles:
-            seen_articles.add(art_num)
-            parent_file = OKF_DIR / "articles" / f"article-{art_num:03d}.md"
-            if parent_file.exists():
+        if unit_num and key not in seen_units:
+            seen_units.add(key)
+            parent_file = None
+
+            if doc_id == "constitution":
+                parent_file = CONSTITUTION_DIR / "articles" / f"article-{unit_num:03d}.md"
+            elif doc_id == "criminal_procedure":
+                parent_file = CRIMINAL_PROC_DIR / "sections" / f"section-{unit_num:03d}.md"
+
+            if parent_file and parent_file.exists():
                 try:
                     full_text = parent_file.read_text(encoding="utf-8")
                     m = re.match(r"^---\s*\n.*?\n---\s*\n", full_text, re.DOTALL)
@@ -518,119 +584,85 @@ def hydrate_parent_context(child_chunks: list[dict[str, Any]]) -> list[dict[str,
                 except Exception:
                     pass
 
-        if not art_num or art_num not in seen_articles:
+        if not unit_num or key not in seen_units:
             hydrated.append(chunk)
 
     return hydrated
 
 
 # ============================================================================
-# LAYER 5: Domain-Aware Prompt Assembly
+# LAYER 5: Domain-Aware Dynamic Prompt Assembly
 # ============================================================================
 
-BASE_SYSTEM_PROMPT = """You are "Samvidhan AI", an authoritative and expert Legal AI Assistant specialized in the Constitution of Nepal (2072 / 2015) and Nepali jurisprudence.
+BASE_SYSTEM_PROMPT = """You are "Samvidhan & Nyaya AI", an authoritative and expert Legal AI Assistant specialized in the Laws of Nepal:
+1. The Constitution of Nepal (2015 / 2072)
+2. The National Criminal Procedure (Code) Act, 2017 (Muluki Faujdari Karyavidhi Samhita, 2074)
 
-Your mission is to provide rigorous, clear, and highly accurate legal and constitutional analysis.
+Your mission is to provide rigorous, clear, and highly accurate statutory and constitutional legal analysis under Nepali jurisprudence.
 
 STRICT LEGAL CITATION RULES:
 1. CITATION NOTATION:
-   - Always use standard constitutional legal notation: "Article {N}({clause})({subclause})" (e.g., "Article 25(1)" or "Article 64(1)(b)").
-   - State the PDF Page number in parentheses when introducing the provision (e.g., "Article 25 (Page 13)").
+   - For Constitution: Cite as "Article {N}({clause}) (Constitution of Nepal, Part {P}, Page {Page})" (e.g., "Article 20(3) (Page 11)").
+   - For Criminal Procedure: Cite as "Section {N}({sub-section}) (National Criminal Procedure Code, Chapter {C}, Page {Page})" (e.g., "Section 14(1) (Page 20)").
+2. GROUNDING: Cite only provisions supported by the retrieved statutory and constitutional context.
+3. CLEAR SEPARATION: Explicitly distinguish between constitutional fundamental rights and statutory procedural requirements.
 """
 
-# Domain-specific instruction blocks injected based on query intent
 DOMAIN_INSTRUCTIONS = {
     "CONSTITUTIONAL_DIRECT": """
 FOR THIS DIRECT CONSTITUTIONAL QUESTION:
 - Provide a direct 1-2 sentence executive answer first.
 - Break down the text of the governing Article and Clauses.
-- Include a summary table: | Article & Clause | Constitutional Requirement | PDF Page |
-- Cite verbatim clause text where possible.
+- Include a summary table: | Article & Clause | Requirement | Page |
+""",
+
+    "STATUTORY_CRIMINAL": """
+FOR THIS CRIMINAL PROCEDURE QUERY / SCENARIO:
+Structure your analysis clearly:
+1. **EXECUTIVE LEGAL CONCLUSION**: Direct 2-3 sentence answer on legality and procedural compliance.
+2. **STATUTORY PROVISIONS APPLIED**:
+   - Quote and analyze each governing Section (e.g., Section 14 for 24-hr detention/remand, Section 18 for search powers, Section 19 for witness presence/deed execution).
+3. **PROCEDURAL DEFECTS & IRREGULARITIES**:
+   - Identify every procedural violation committed (e.g., unlawful nighttime search without emergency exception, absence of local representatives/witnesses, detention beyond 24 hours without remand).
+4. **LEGAL CONSEQUENCES & REMEDIES**:
+   - What happens to evidence seized in violation of mandatory procedural safeguards.
+   - Habeas Corpus or bail remedy if detention is unlawful.
 """,
 
     "CONSTITUTIONAL_SCENARIO": """
 FOR THIS CONSTITUTIONAL SCENARIO / FACT PATTERN:
-Structure your analysis using the FIRAC legal framework:
-
-1. **FACTS SUMMARY**: Restate the key facts in 2-3 sentences.
-2. **LEGAL ISSUES SPOTTING**: State the specific questions of law raised by the facts.
-3. **GOVERNING CONSTITUTIONAL PROVISIONS**: Cite and break down the relevant fundamental rights with clause-level precision. Include the full text of governing clauses.
-4. **LEGAL ANALYSIS (Application to Facts)**: Apply each constitutional provision to the specific facts. Explain WHY each provision applies or does not apply.
-5. **REMEDY PATHWAY**: Specify the exact constitutional remedy chain:
-   - Article 46 (Right to Constitutional Remedies)
-   - Article 133 (Supreme Court extraordinary writ jurisdiction) OR Article 144 (High Court writ jurisdiction)
-   - Specify which type of writ applies (certiorari, mandamus, habeas corpus, prohibition, quo warranto)
-6. **ACTIONABLE LEGAL NEXT STEPS**: Concrete lawful procedure the person should follow.
-
-ANTI-HALLUCINATION GUARDRAILS:
-- ONLY cite articles that appear in the RETRIEVED CONSTITUTIONAL CONTEXT below.
-- If the scenario involves a dimension that the Constitution does not directly address (private civil disputes), explicitly state that the Constitution provides the foundational right but enforcement is through statutory law.
-""",
-
-    "STATUTORY_CIVIL": """
-FOR THIS PRIVATE CIVIL LAW DISPUTE:
-
-CRITICAL INSTRUCTION: This dispute is primarily governed by STATUTORY law, not constitutional writs.
-
-Structure your response as follows:
-1. **CONSTITUTIONAL FOUNDATION**: Identify the fundamental right that provides the constitutional backdrop (e.g., Article 25 - Right to Property). Quote the relevant clause text.
-2. **STATUTORY JURISDICTION NOTICE**: State clearly and prominently:
-   > "This dispute is primarily adjudicated under the **Muluki Civil Code, 2074 (muulukii devaanii sanhitaa)** in the **District Court**, not through a constitutional writ petition."
-3. **APPLICABLE CONSTITUTIONAL PROVISIONS**: Break down which constitutional rights are foundational guarantees (right to property, right to justice, etc.).
-4. **PRACTICAL LEGAL PATHWAY**:
-   - Administrative remedies first (Land Revenue Office / Survey Office / Napi-Malpot for boundary demarcation)
-   - Filing a civil suit in District Court (injunction, eviction, damages, specific performance)
-   - Constitutional writ ONLY if a fundamental right is violated by the STATE
-5. **WHAT THE CONSTITUTION DOES AND DOES NOT COVER**: Explicitly distinguish between the constitutional guarantee and the statutory enforcement mechanism.
-
-NEVER invent or hallucinate non-existent constitutional clauses for everyday civil matters.
-""",
-
-    "STATUTORY_CRIMINAL": """
-FOR THIS CRIMINAL LAW MATTER:
-
-CRITICAL INSTRUCTION: Criminal matters are prosecuted under the **Muluki Criminal Code, 2074 (muulukii phoujdaarii sanhitaa)**.
-
-Structure your response as follows:
-1. **CONSTITUTIONAL RIGHTS OF THE ACCUSED/VICTIM**: Identify fundamental rights at stake (e.g., Article 20 - Right relating to justice, Article 22 - Right against torture, Article 17 - Right to freedom).
-2. **CRIMINAL JURISDICTION**: State that investigation and prosecution occur through Nepal Police and the District Attorney's Office under the Muluki Criminal Code.
-3. **CONSTITUTIONAL PROTECTIONS**: Detail constitutional safeguards (right to fair trial, presumption of innocence, right against self-incrimination, right to legal counsel).
-4. **PRACTICAL STEPS**: Filing an FIR, investigation process, court jurisdiction.
+Structure your analysis using the FIRAC framework:
+1. **FACTS SUMMARY**: Restate the key facts in 2 sentences.
+2. **LEGAL ISSUES**: State the specific constitutional questions.
+3. **GOVERNING CONSTITUTIONAL PROVISIONS**: Cite and break down the relevant fundamental rights with clause precision.
+4. **LEGAL ANALYSIS**: Apply each provision to the facts.
+5. **REMEDY PATHWAY**: Specify the remedy chain (Article 46 -> Article 133 / 144 writ petition).
 """,
 
     "MIXED": """
-FOR THIS MIXED (CONSTITUTIONAL + STATUTORY) MATTER:
-
-This query has BOTH constitutional and statutory dimensions. Address them separately:
-
-**PART A - CONSTITUTIONAL DIMENSION:**
-- Identify which fundamental rights are at stake.
-- Use FIRAC framework for the constitutional analysis.
-- Specify the remedy pathway (Article 46 -> Article 133/144 writs).
-
-**PART B - STATUTORY DIMENSION:**
-- Identify which statutory law governs the non-constitutional aspect.
-- Specify the court jurisdiction and procedural pathway.
-- Distinguish clearly between what requires a constitutional writ vs. a regular civil/criminal suit.
-
-ANTI-HALLUCINATION: Only cite constitutional articles present in the context. State explicitly when statutory law (Muluki Civil/Criminal Code) governs instead of the Constitution.
+FOR THIS MIXED CONSTITUTIONAL AND STATUTORY MATTER:
+Structure your answer into distinct sections:
+1. **PART A - STATUTORY PROCEDURAL ANALYSIS (Criminal Procedure Code, 2017)**:
+   - Detailed statutory analysis under the relevant Sections (e.g., Sections 14, 18, 19, 72).
+   - Analysis of procedural legality, detention time limits, and search defects.
+2. **PART B - CONSTITUTIONAL PROTECTIONS & FUNDAMENTAL RIGHTS (Constitution of Nepal, 2015)**:
+   - Fundamental rights of the accused under Article 20 (Right relating to justice), Article 23 (Preventive detention), Article 17.
+   - Constitutional guarantees for 24-hour presentation before a judicial authority.
+3. **PART C - REMEDIES & ACTIONS**:
+   - Court remedies (remand contest, bail application, writ of Habeas Corpus under Article 133/144).
 """,
 }
 
 
 def build_system_prompt(intent: dict[str, Any]) -> str:
-    """Assemble the system prompt dynamically based on query intent classification."""
-    intent_type = intent.get("intent", "CONSTITUTIONAL_DIRECT")
-    domain_block = DOMAIN_INSTRUCTIONS.get(intent_type, DOMAIN_INSTRUCTIONS["CONSTITUTIONAL_DIRECT"])
-    return BASE_SYSTEM_PROMPT + domain_block
+    """Assemble system prompt based on query intent."""
+    intent_type = intent.get("intent", "MIXED")
+    domain_block = DOMAIN_INSTRUCTIONS.get(intent_type, DOMAIN_INSTRUCTIONS["MIXED"])
+    return BASE_SYSTEM_PROMPT + "\n\n" + domain_block
 
-
-# ============================================================================
-# LLM Generation via OpenRouter (Streaming)
-# ============================================================================
 
 def stream_openrouter(messages: list[dict[str, str]]) -> str:
-    """Stream OpenRouter chat completions token by token to stdout in real time."""
+    """Stream response from OpenRouter."""
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is missing in .env file.")
 
@@ -638,166 +670,52 @@ def stream_openrouter(messages: list[dict[str, str]]) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://okf-samvidhan.local",
-        "X-Title": "Nepal Samvidhan Legal AI",
     }
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 1500,
         "stream": True,
+        "temperature": 0.1,
     }
 
     resp = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
     if resp.status_code != 200:
-        raise RuntimeError(f"OpenRouter API Error ({resp.status_code}): {resp.text}")
+        raise RuntimeError(f"OpenRouter API error {resp.status_code}: {resp.text}")
 
-    full_chunks = []
+    full_response = []
     for line in resp.iter_lines(decode_unicode=True):
-        if not line:
+        if not line or not line.startswith("data: "):
             continue
-        if line.startswith("data: "):
-            chunk_data = line[6:].strip()
-            if chunk_data == "[DONE]":
-                break
-            try:
-                chunk_json = json.loads(chunk_data)
-                delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                content_chunk = delta.get("content", "")
-                if content_chunk:
-                    full_chunks.append(content_chunk)
-                    sys.stdout.write(content_chunk)
-                    sys.stdout.flush()
-            except json.JSONDecodeError:
-                continue
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+            delta = chunk["choices"][0]["delta"].get("content", "")
+            if delta:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+                full_response.append(delta)
+        except Exception:
+            continue
 
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-    return "".join(full_chunks)
+    print()
+    return "".join(full_response)
 
 
 # ============================================================================
-# Terminal UI Helpers
+# Session & User Interface
 # ============================================================================
 
 def print_banner():
     banner = """
 ================================================================================
-           NEPAL SAMVIDHAN (CONSTITUTION) LEGAL AI ASSISTANT
-            5-Layer Scenario-Aware RAG | Multi-Tenant OKF
+           NEPAL LEGAL AI ASSISTANT (SAMVIDHAN & NYAYA)
+       Constitution (2015) + Criminal Procedure Code (2017)
+             Two-Tier pgvector Store | OpenRouter LLM
 ================================================================================
 """
     print(banner)
-
-
-def handle_signup() -> dict[str, Any] | None:
-    print("\n--- NEW USER SIGNUP ---")
-    try:
-        first_name = input("First Name *: ").strip()
-        middle_name = input("Middle Name (optional): ").strip() or None
-        last_name = input("Last Name *: ").strip()
-        phone_number = input("Phone Number (optional): ").strip() or None
-        address = input("Address (optional): ").strip() or None
-        profession = input("Profession (optional, e.g. Lawyer, Student): ").strip() or None
-        organization = input("Organization (optional): ").strip() or None
-        email = input("Email *: ").strip()
-
-        # Secure password input
-        password = getpass.getpass("Password * (min 6 chars): ")
-        confirm_password = getpass.getpass("Confirm Password *: ")
-
-        # Step 1: Initiate signup & send OTP to email
-        print(f"\n[INFO] Sending 6-digit verification code to {email}...")
-        signup_res = auth_service.initiate_signup(
-            first_name=first_name,
-            middle_name=middle_name,
-            last_name=last_name,
-            email=email,
-            password=password,
-            confirm_password=confirm_password,
-            phone_number=phone_number,
-            address=address,
-            profession=profession,
-            organization=organization,
-        )
-
-        clean_email = signup_res["email"]
-        print("\n" + "=" * 65)
-        print(f"  VERIFICATION CODE SENT")
-        print(f"  A 6-digit OTP code has been dispatched to: {clean_email}")
-        print("  Please check your inbox (and spam folder). Code valid for 10 min.")
-        print("=" * 65)
-
-        # Step 2: Loop to verify OTP
-        attempts = 0
-        max_attempts = 5
-        while attempts < max_attempts:
-            otp_input = input("\nEnter 6-digit OTP [or 'r' to resend, 'c' to cancel]: ").strip()
-
-            if otp_input.lower() in ("c", "cancel", "q", "quit"):
-                print("[INFO] Signup cancelled. You can sign up again at any time.")
-                return None
-
-            if otp_input.lower() in ("r", "resend"):
-                try:
-                    auth_service.resend_signup_otp(clean_email)
-                    print(f"[SUCCESS] Fresh verification code sent to {clean_email}.")
-                except Exception as ex:
-                    print(f"[ERROR] Could not resend code: {ex}")
-                continue
-
-            if not otp_input:
-                continue
-
-            try:
-                user = auth_service.complete_signup(clean_email, otp_input)
-                print(f"\n[SUCCESS] Email verified! Welcome, {user['first_name']} {user['last_name']}.")
-                return user
-            except Exception as e:
-                attempts += 1
-                remaining = max_attempts - attempts
-                print(f"[ERROR] {e} ({remaining} attempts remaining)")
-
-        print("\n[ERROR] Maximum verification attempts reached. Please try signing up again.")
-        return None
-
-    except Exception as e:
-        print(f"\n[ERROR] Signup failed: {e}")
-        return None
-
-
-def handle_login() -> dict[str, Any] | None:
-    print("\n--- USER LOGIN ---")
-    try:
-        email = input("Email: ").strip()
-        password = getpass.getpass("Password: ")
-        
-        try:
-            user = auth_service.login(email, password)
-            print(f"\n[SUCCESS] Login successful! Welcome back, {user['first_name']} {user['last_name']}.")
-            return user
-        except ValueError as ve:
-            if "not verified" in str(ve).lower():
-                print(f"\n[NOTICE] {ve}")
-                verify_choice = input("Would you like to verify your email now? (y/n): ").strip().lower()
-                if verify_choice == "y":
-                    try:
-                        auth_service.resend_signup_otp(email)
-                        otp_input = input("Enter 6-digit OTP sent to your email: ").strip()
-                        user = auth_service.complete_signup(email, otp_input)
-                        print(f"\n[SUCCESS] Email verified! Welcome, {user['first_name']} {user['last_name']}.")
-                        return user
-                    except Exception as otp_err:
-                        print(f"[ERROR] Verification failed: {otp_err}")
-                        return None
-            else:
-                raise ve
-
-    except Exception as e:
-        print(f"\n[ERROR] Login failed: {e}")
-        return None
-
 
 
 def select_or_create_session(user: dict[str, Any]) -> dict[str, Any]:
@@ -810,7 +728,8 @@ def select_or_create_session(user: dict[str, Any]) -> dict[str, Any]:
     for idx, s in enumerate(sessions, 1):
         dt = s["created_at"].strftime("%Y-%m-%d %H:%M") if hasattr(s["created_at"], "strftime") else str(s["created_at"])[:16]
         msgs = s.get("message_count", 0)
-        print(f"  [{idx}] {s['title']} ({msgs} msgs, created: {dt})")
+        mode = s.get("chat_mode", "all_laws")
+        print(f"  [{idx}] {s['title']} ({msgs} msgs, mode: {mode}, created: {dt})")
     print("------------------------------------------------------------")
 
     choice = input("Select a session (or 0 for new): ").strip()
@@ -820,20 +739,38 @@ def select_or_create_session(user: dict[str, Any]) -> dict[str, Any]:
             return sessions[sel_idx]
 
     # Create new session
-    title = input("Enter a title for this chat (press Enter for 'General Inquiry'): ").strip()
+    title = input("Enter a title for this chat (press Enter for 'Legal Consultation'): ").strip()
     if not title:
-        title = "General Inquiry"
-    return auth_service.create_chat_session(user["id"], title=title, chat_mode="constitution")
+        title = "Legal Consultation"
 
+    print("\nSelect Legal Scope:")
+    print("  [1] All Laws (Constitution + Criminal Procedure Code) [Recommended]")
+    print("  [2] The National Criminal Procedure (Code) Act, 2017")
+    print("  [3] Constitution of Nepal, 2015")
+    mode_choice = input("Select scope (1-3, default 1): ").strip()
 
-# ============================================================================
-# Main Interactive Chat Loop (5-Layer Pipeline)
-# ============================================================================
+    if mode_choice == "2":
+        chat_mode = "criminal_procedure"
+    elif mode_choice == "3":
+        chat_mode = "constitution"
+    else:
+        chat_mode = "all_laws"
+
+    return auth_service.create_chat_session(user["id"], title=title, chat_mode=chat_mode)
+
 
 def chat_loop(user: dict[str, Any], session: dict[str, Any]):
+    chat_mode = session.get("chat_mode", "all_laws")
+    mode_desc = {
+        "all_laws": "All Nepali Laws (Constitution + Criminal Procedure Code)",
+        "criminal_procedure": "The National Criminal Procedure (Code) Act, 2017",
+        "constitution": "The Constitution of Nepal, 2015",
+    }.get(chat_mode, "All Laws")
+
     print("\n" + "=" * 70)
-    print(f"SESSION: {session['title']} (Mode: {session.get('chat_mode', 'constitution')})")
-    print("Ask any question regarding the Constitution of Nepal.")
+    print(f"SESSION: {session['title']}")
+    print(f"SCOPE:   {mode_desc}")
+    print("Ask any question regarding Nepali constitutional or criminal procedural law.")
     print("Commands: /history, /sessions, /sources, /exit")
     print("=" * 70)
 
@@ -849,14 +786,13 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
         if not prompt:
             continue
 
-        # Command handling
         if prompt.lower() in ("/exit", "/quit", "/back"):
             break
         elif prompt.lower() == "/history":
             history = auth_service.get_chat_history(session["id"], user["id"])
             print(f"\n--- SESSION HISTORY ({len(history)} messages) ---")
             for msg in history:
-                speaker = "YOU" if msg["role"] == "user" else "SAMVIDHAN AI"
+                speaker = "YOU" if msg["role"] == "user" else "LEGAL AI"
                 print(f"\n[{speaker}]:")
                 print(msg["content"])
             print("--- END HISTORY ---\n")
@@ -867,131 +803,121 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
             else:
                 print("\n--- RETRIEVED SOURCES FOR LAST ANSWER ---")
                 for s in last_retrieved_sources:
-                    xref_tag = " [CROSS-REF]" if s.get("is_cross_ref") else ""
-                    print(f"- {s.get('title')} | Page: {s.get('page')} | Score: {s.get('rerank_score', 0):.4f}{xref_tag}")
+                    doc = s.get("document_title") or s.get("document_id", "")
+                    ref = s.get("structural_ref") or s.get("title", "")
+                    xref = " [CROSS-REF]" if s.get("is_cross_ref") else ""
+                    print(f"- {doc} | {ref}: {s.get('title')} (Page {s.get('page')}){xref}")
                 print("------------------------------------------\n")
             continue
         elif prompt.lower() == "/sessions":
             session = select_or_create_session(user)
-            print(f"\nSwitched to session: {session['title']}\n")
+            chat_mode = session.get("chat_mode", "all_laws")
+            print(f"\nSwitched to session: {session['title']} (Mode: {chat_mode})\n")
             continue
 
-        # ================================================================
-        # LAYER 1: Query Intent Classification
-        # ================================================================
+        # 1. Intent Classification
         print("\n[1/5] Classifying query intent...")
         intent = classify_query_intent(prompt)
-        intent_type = intent.get("intent", "CONSTITUTIONAL_DIRECT")
+        intent_type = intent.get("intent", "MIXED")
         print(f"       Domain: {intent_type}")
-        if intent.get("suggested_articles"):
-            print(f"       Suggested Articles: {intent['suggested_articles']}")
+        if intent.get("suggested_provisions"):
+            print(f"       Suggested Provisions: {intent['suggested_provisions']}")
 
-        # ================================================================
-        # LAYER 2: Multi-Query Decomposition
-        # ================================================================
+        # 2. Query Decomposition
         print("[2/5] Decomposing into sub-queries...")
         sub_queries = decompose_query(prompt, intent)
-        print(f"       Generated {len(sub_queries)} search queries")
+        print(f"       Generated {len(sub_queries)} search angles")
 
-        # ================================================================
-        # LAYER 3: Multi-Query Hybrid Retrieval + Graph Expansion
-        # ================================================================
-        print("[3/5] Hybrid retrieval + cross-reference expansion...")
-        candidates = retrieve_multi_query(sub_queries, top_k_per_query=10)
-        print(f"       Retrieved {len(candidates)} unique candidates")
+        # 3. Two-Tier Multi-Document Retrieval
+        print("[3/5] Retrieving from Two-Tier Supabase Knowledge Base...")
+        doc_filter = None if chat_mode == "all_laws" else chat_mode
+        candidates = retrieve_multi_query(
+            sub_queries,
+            top_k_per_query=10,
+            document_id=doc_filter,
+            user_prompt=prompt,
+            suggested_provisions=intent.get("suggested_provisions", []),
+        )
+        print(f"       Retrieved {len(candidates)} candidate provisions")
 
-        # Expand with cross-referenced articles
+        # Expand constitutional cross-references
         candidates = expand_with_cross_references(candidates, intent)
-        print(f"       After graph expansion: {len(candidates)} candidates")
 
-        # ================================================================
-        # LAYER 4: Scenario-Aware Reranking
-        # ================================================================
-        print("[4/5] Reranking with intent-aware scoring...")
-        reranked = rerank_candidates(prompt, candidates, intent, top_k=5)
-        print(f"       Top {len(reranked)} candidates selected")
+        # 4. Scenario-Aware Reranking (with Statutory & Constitutional Quota)
+        print("[4/5] Reranking candidates...")
+        reranked = rerank_candidates(prompt, candidates, intent, top_k=8)
+        print(f"       Top {len(reranked)} provisions selected")
 
-        # Parent-Child Context Hydration
+        # Hydrate full parent text
         hydrated = hydrate_parent_context(reranked)
         last_retrieved_sources = hydrated
 
-        # ================================================================
-        # LAYER 5: Domain-Aware Prompt Assembly
-        # ================================================================
-        print("[5/5] Assembling domain-specific prompt...")
-
-        # Format context for LLM
+        # 5. Domain-Aware Dynamic Prompt Assembly
+        print("[5/5] Assembling statutory & constitutional prompt...")
         context_blocks = []
         citations_metadata = []
+
         for doc in hydrated:
-            art_num = doc.get("article_number")
-            part_num = doc.get("part_number")
+            doc_name = doc.get("document_title") or doc.get("document_id", "Nepal Law")
+            ref_name = doc.get("structural_ref") or doc.get("title", "")
+            parent_title = doc.get("parent_title", "")
+            parent_num = doc.get("parent_number")
             page_num = doc.get("page")
-            title = doc.get("title", "")
             content = doc.get("content", "")
             xref_tag = " [Cross-Referenced]" if doc.get("is_cross_ref") else ""
 
-            block = f"--- SOURCE: {title}{xref_tag} ---\nPart: {part_num} | Article: {art_num} | Page: {page_num}\n{content}\n"
+            block = (
+                f"--- SOURCE: {doc_name} | {ref_name}{xref_tag} ---\n"
+                f"Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
+                f"{content}\n"
+            )
             context_blocks.append(block)
 
             citations_metadata.append({
-                "article_number": art_num,
-                "part_number": part_num,
+                "document_id": doc.get("document_id"),
+                "document_title": doc_name,
+                "structural_ref": ref_name,
+                "unit_number": doc.get("unit_number"),
                 "page": page_num,
-                "title": title,
-                "clause_count": doc.get("clause_count", 0),
+                "title": doc.get("title"),
                 "is_cross_ref": doc.get("is_cross_ref", False),
             })
 
         combined_context = "\n".join(context_blocks)
-
-        # Build domain-aware system prompt
         system_prompt = build_system_prompt(intent)
 
-        # Fetch recent conversation history for multi-turn context
+        # Multi-turn history
         history = auth_service.get_chat_history(session["id"], user["id"])
-        recent_history = history[-6:]  # Last 3 turns
+        recent_history = history[-6:]
 
         messages = [{"role": "system", "content": system_prompt}]
-
         for h in recent_history:
             messages.append({"role": h["role"], "content": h["content"]})
 
-        # User turn with augmented context
-        user_turn_content = f"""QUERY CLASSIFICATION: {intent_type}
-{f"REASONING: {intent.get('reasoning', '')}" if intent.get('reasoning') else ""}
+        user_turn_content = f"""QUERY INTENT: {intent_type}
+{f"ANALYSIS FOCUS: {intent.get('reasoning', '')}" if intent.get('reasoning') else ""}
 
-RETRIEVED CONSTITUTIONAL CONTEXT:
+RETRIEVED LEGAL CONTEXT (CONSTITUTION & STATUTES):
 {combined_context}
 
-USER QUESTION:
+USER QUESTION / SCENARIO:
 {prompt}
 
-Please answer the user's question with precise Article and Clause citations from the context above."""
+Please answer the user's question directly and thoroughly with exact Article / Section citations from the context above."""
 
         messages.append({"role": "user", "content": user_turn_content})
 
-        # Stream Response Live
+        # Stream LLM Response
         print("\n" + "=" * 70)
-        print("SAMVIDHAN AI:")
+        print("LEGAL AI:")
         print("=" * 70)
         try:
             ai_response = stream_openrouter(messages)
         except Exception as e:
-            print(f"\n[ERROR] Could not generate response: {e}")
+            print(f"\n[ERROR] Generation failed: {e}")
             continue
 
-        # Filter citations: Only retain articles actually referenced in the AI response
-        mentioned_arts = set(map(int, re.findall(r"(?:Article|Art\.)\s*(\d+)", ai_response, re.IGNORECASE)))
-        verified_sources = [
-            c for c in citations_metadata
-            if c.get("article_number") in mentioned_arts
-        ]
-        # Fallback to top retrieved document if no specific article number was matched
-        if not verified_sources and citations_metadata:
-            verified_sources = citations_metadata[:1]
-
-        # Save to database (Isolated per user and session)
+        # Save conversation turn
         auth_service.add_chat_message(
             session_id=session["id"],
             user_id=user["id"],
@@ -1003,46 +929,78 @@ Please answer the user's question with precise Article and Clause citations from
             user_id=user["id"],
             role="assistant",
             content=ai_response,
-            sources=verified_sources,
+            sources=citations_metadata,
         )
 
-        # Display Clean Citations Footer
-        if verified_sources:
+        # Display Citations Footer
+        if citations_metadata:
             print("\n------------------------------------------------------------")
-            print("PRIMARY CONSTITUTIONAL PROVISIONS APPLIED:")
-            seen_articles = set()
-            for c in verified_sources:
-                art = c.get("article_number")
-                if art and art not in seen_articles:
-                    seen_articles.add(art)
+            print("PRIMARY LEGAL PROVISIONS APPLIED:")
+            seen_refs = set()
+            for c in citations_metadata:
+                ref_key = f"{c.get('document_id')}:{c.get('structural_ref')}"
+                if ref_key not in seen_refs:
+                    seen_refs.add(ref_key)
+                    doc_title = c.get("document_title", "")
+                    ref = c.get("structural_ref", "")
+                    page = c.get("page")
                     xref = " [via Cross-Reference]" if c.get("is_cross_ref") else ""
-                    print(f"  * Article {art}: {c.get('title')} (PDF Page {c.get('page')}){xref}")
+                    print(f"  * {doc_title} -- {ref}: {c.get('title')} (Page {page}){xref}")
             print("------------------------------------------------------------")
 
 
 # ============================================================================
-# Main Entry Point
+# Main Entry Point & Authentication
 # ============================================================================
+
+def handle_login() -> dict[str, Any] | None:
+    print("\n--- USER LOGIN ---")
+    email = input("Email: ").strip()
+    password = getpass.getpass("Password: ")
+    try:
+        user = auth_service.login(email, password)
+        print(f"\n[SUCCESS] Login successful! Welcome back, {user['first_name']} {user['last_name']}.")
+        return user
+    except Exception as e:
+        print(f"\n[ERROR] Login failed: {e}")
+        return None
+
+
+def handle_signup() -> dict[str, Any] | None:
+    print("\n--- NEW USER SIGNUP ---")
+    first_name = input("First Name: ").strip()
+    last_name = input("Last Name: ").strip()
+    email = input("Email: ").strip()
+    password = getpass.getpass("Password (min 8 chars, 1 upper, 1 digit, 1 special): ")
+    try:
+        user = auth_service.signup(
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            password=password,
+            auto_verify=True,
+        )
+        print(f"\n[SUCCESS] Account created! Welcome, {user['first_name']}.")
+        return user
+    except Exception as e:
+        print(f"\n[ERROR] Signup failed: {e}")
+        return None
+
 
 def main():
     print_banner()
 
-    # Pre-load the article graph at startup
     graph = get_article_graph()
     if graph:
-        print(f"[INIT] Article cross-reference graph loaded: {len(graph)} articles with outgoing refs")
-    else:
-        print("[INIT] WARNING: Article graph not found. Run 'python build_article_graph.py' first.")
+        print(f"[INIT] Constitution cross-reference graph loaded: {len(graph)} articles")
 
     current_user = None
-
     while current_user is None:
         print("\nMAIN MENU:")
         print("  [1] Log In")
         print("  [2] Sign Up")
         print("  [3] Exit")
         choice = input("\nSelect an option (1-3): ").strip()
-
         if choice == "1":
             current_user = handle_login()
         elif choice == "2":
@@ -1050,19 +1008,9 @@ def main():
         elif choice == "3":
             print("\nGoodbye!")
             sys.exit(0)
-        else:
-            print("Invalid option. Please choose 1, 2, or 3.")
 
-    # User is logged in
-    while True:
-        session = select_or_create_session(current_user)
-        chat_loop(current_user, session)
-
-        print("\nOptions: [1] Open Another Session  [2] Logout / Exit")
-        after_choice = input("Select (1 or 2): ").strip()
-        if after_choice != "1":
-            print(f"\nGoodbye, {current_user['first_name']}!")
-            break
+    session = select_or_create_session(current_user)
+    chat_loop(current_user, session)
 
 
 if __name__ == "__main__":
