@@ -102,6 +102,27 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw ON knowledge.document_chunk
 USING hnsw (embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
+-- ----------------------------------------------------------------------------
+-- STATUTORY CITATION GRAPH EDGES (Inter-provision cross-references)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS knowledge.citation_edges (
+    id BIGSERIAL PRIMARY KEY,
+    source_document_id TEXT NOT NULL REFERENCES knowledge.documents(id) ON DELETE CASCADE,
+    source_unit_number INTEGER NOT NULL,
+    target_document_id TEXT NOT NULL REFERENCES knowledge.documents(id) ON DELETE CASCADE,
+    target_unit_number INTEGER NOT NULL,
+    relation_type TEXT NOT NULL DEFAULT 'refers_to',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(source_document_id, source_unit_number, target_document_id, target_unit_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_citation_source 
+ON knowledge.citation_edges(source_document_id, source_unit_number);
+
+CREATE INDEX IF NOT EXISTS idx_citation_target 
+ON knowledge.citation_edges(target_document_id, target_unit_number);
+
 -- Unified Multi-Document Retrieval RPC
 CREATE OR REPLACE FUNCTION knowledge.match_documents(
     query_embedding VECTOR(1536),

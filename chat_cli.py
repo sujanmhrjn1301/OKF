@@ -91,16 +91,42 @@ def get_rerank_model():
 
 
 def get_article_graph() -> dict[str, list[int]]:
-    """Load the pre-built constitutional article cross-reference graph from JSON."""
+    """Load the constitutional article cross-reference graph from Supabase (with disk fallback)."""
     global _ARTICLE_GRAPH
-    if _ARTICLE_GRAPH is None:
-        if ARTICLE_GRAPH_PATH.exists():
-            try:
-                _ARTICLE_GRAPH = json.loads(ARTICLE_GRAPH_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                _ARTICLE_GRAPH = {}
-        else:
-            _ARTICLE_GRAPH = {}
+    if _ARTICLE_GRAPH is not None:
+        return _ARTICLE_GRAPH
+
+    # 1. Try loading directly from Supabase cloud
+    try:
+        conn = auth_service.get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source_unit_number, target_unit_number 
+                FROM knowledge.citation_edges 
+                WHERE source_document_id = 'constitution'
+                ORDER BY source_unit_number, target_unit_number;
+            """)
+            rows = cur.fetchall()
+        conn.close()
+
+        if rows:
+            graph: dict[str, list[int]] = {}
+            for src, tgt in rows:
+                graph.setdefault(str(src), []).append(tgt)
+            _ARTICLE_GRAPH = graph
+            return _ARTICLE_GRAPH
+    except Exception:
+        pass
+
+    # 2. Local fallback if DB is unreachable and local file exists
+    if ARTICLE_GRAPH_PATH.exists():
+        try:
+            _ARTICLE_GRAPH = json.loads(ARTICLE_GRAPH_PATH.read_text(encoding="utf-8"))
+            return _ARTICLE_GRAPH
+        except Exception:
+            pass
+
+    _ARTICLE_GRAPH = {}
     return _ARTICLE_GRAPH
 
 
