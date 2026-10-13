@@ -24,14 +24,12 @@ OKF spec  : Each file is Markdown with YAML front-matter.
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 try:
     import fitz  # PyMuPDF

@@ -27,10 +27,8 @@ Output Directory : data/okf/criminal_procedure/
 
 from __future__ import annotations
 
-import os
 import re
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -242,18 +240,6 @@ def parse_proviso_in_block(text: str) -> tuple[str, str]:
         text = text[:prov_match.start()]
 
     return clean_text(text), proviso
-
-
-def parse_explanation_in_block(text: str) -> tuple[str, str]:
-    """Extract Explanation from a text block."""
-    explanation = ""
-
-    exp_match = re.search(r"(?:^|\n)\s*(Explanation:?[\s\S]*?)$", text, re.I)
-    if exp_match:
-        explanation = clean_text(exp_match.group(1))
-        text = text[:exp_match.start()]
-
-    return clean_text(text), explanation
 
 
 def parse_clauses_in_text(text: str) -> tuple[str, list[ClauseItem]]:

@@ -6,31 +6,7 @@ db_schema.py -- Setup Supabase Database Schemas and Tables for:
 4. Chat History (Per-user conversations and message history with sources)
 """
 
-import os
-import psycopg2
-from dotenv import load_dotenv
-from pathlib import Path
-
-load_dotenv(Path(__file__).with_name(".env"))
-
-DB_HOST = os.getenv("SUPABASE_DB_HOST", "")
-DB_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
-DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
-DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
-DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
-
-
-def get_db_connection():
-    """Connect to Supabase PostgreSQL using pooler or direct host."""
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        sslmode="require",
-        connect_timeout=10,
-    )
+from auth_service import get_db_connection
 
 
 SQL_SCHEMA_SETUP = """

@@ -143,7 +143,7 @@ def get_cloud_citation_graph() -> dict[tuple[str, int], list[dict[str, Any]]]:
                         "relation_type": "refers_to_article",
                         "metadata": meta,
                     })
-        except Exception:
+        except (json.JSONDecodeError, OSError):
             pass
 
     act_graph_path = CRIMINAL_PROC_DIR / "act_graph.json"
@@ -167,7 +167,7 @@ def get_cloud_citation_graph() -> dict[tuple[str, int], list[dict[str, Any]]]:
                         "relation_type": "cites_constitutional_article",
                         "metadata": meta,
                     })
-        except Exception:
+        except (json.JSONDecodeError, OSError):
             pass
 
     _CLOUD_CITATION_GRAPH = fallback_graph
@@ -243,7 +243,7 @@ def classify_query_intent(query: str) -> dict[str, Any]:
                 if result.get("intent") not in INTENT_CATEGORIES:
                     result["intent"] = "MIXED"
                 return result
-    except Exception:
+    except (json.JSONDecodeError, KeyError, TypeError, requests.RequestException):
         pass
 
     return default_result
@@ -290,15 +290,11 @@ def decompose_query(query: str, intent: dict[str, Any]) -> list[str]:
                 sub_queries = json.loads(arr_match.group())
                 if isinstance(sub_queries, list) and len(sub_queries) >= 2:
                     return [query] + [str(sq) for sq in sub_queries[:3]]
-    except Exception:
+    except (json.JSONDecodeError, KeyError, TypeError, requests.RequestException):
         pass
 
     return [query]
 
-
-# ============================================================================
-# LAYER 3: Two-Tier Multi-Document Retrieval
-# ============================================================================
 
 # ============================================================================
 # LAYER 3: Two-Tier Multi-Document Retrieval (Hybrid + Targeted Metadata)
@@ -680,7 +676,7 @@ def hydrate_parent_context(child_chunks: list[dict[str, Any]]) -> list[dict[str,
                     chunk_copy["is_parent_hydrated"] = True
                     hydrated.append(chunk_copy)
                     continue
-                except Exception:
+                except (OSError, UnicodeDecodeError):
                     pass
 
         if not unit_num or key not in seen_units:

@@ -3,30 +3,7 @@ setup_hybrid_search.py -- Enable Full-Text Search (BM25) and Reciprocal Rank Fus
 in Supabase PostgreSQL for hybrid retrieval.
 """
 
-import os
-import psycopg2
-from dotenv import load_dotenv
-from pathlib import Path
-
-load_dotenv(Path(__file__).with_name(".env"))
-
-DB_HOST = os.getenv("SUPABASE_DB_HOST", "")
-DB_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
-DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
-DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
-DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
-
-
-def get_db_connection():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        sslmode="require",
-        connect_timeout=10,
-    )
+from auth_service import get_db_connection
 
 
 HYBRID_SETUP_SQL = """

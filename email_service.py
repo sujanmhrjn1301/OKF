@@ -11,7 +11,6 @@ Supports:
 
 from __future__ import annotations
 
-import email.message
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart

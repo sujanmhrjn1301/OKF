@@ -43,11 +43,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 MODEL_NAME = "openai/text-embedding-3-small"
 EMBEDDING_DIM = 1536
 
-DB_HOST = os.getenv("SUPABASE_DB_HOST", "")
-DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
-DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
-DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
-DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
+from auth_service import get_db_connection
 
 BASE_DIR = Path(__file__).resolve().parent
 DOCS_TABLE = "knowledge.documents"
@@ -164,19 +160,6 @@ def chunk_document(doc: OKFDocument, max_chunk_size: int = 800) -> list[str]:
 
 
 # -- Database Helpers ---------------------------------------------------------
-def get_db_connection():
-    """Connect to Supabase Postgres directly with SSL."""
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=int(DB_PORT),
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        sslmode="require",
-        connect_timeout=15,
-    )
-
-
 def setup_database() -> None:
     """Ensure two-tier schema and search functions exist."""
     print("[DB] Verifying/creating schema in Supabase...")
@@ -339,7 +322,7 @@ def ingest(source: str) -> None:
 
     # 1. Clean previous data for this document (Cascades automatically to chunks!)
     print(f"[DB] Cleaning previous data for '{doc_id}'...")
-    cur.execute(f"DELETE FROM {DOCS_TABLE} WHERE id = %s;", (doc_id,))
+    cur.execute("DELETE FROM knowledge.documents WHERE id = %s;", (doc_id,))
 
     # 2. Register Document in knowledge.documents
     print(f"[DB] Registering document in {DOCS_TABLE}...")
