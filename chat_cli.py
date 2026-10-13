@@ -196,10 +196,15 @@ INTENT_CATEGORIES = {
     "STATUTORY_CRIMINAL",
     "STATUTORY_CIVIL",
     "MIXED",
+    "FOLLOW_UP",
 }
 
 
-def classify_query_intent(query: str) -> dict[str, Any]:
+def classify_query_intent(
+    query: str,
+    recent_history: list[dict[str, Any]] | None = None,
+    has_active_context: bool = False,
+) -> dict[str, Any]:
     """Classify the query's legal domain and intent using OpenRouter."""
     default_result = {
         "intent": "MIXED",
@@ -210,6 +215,21 @@ def classify_query_intent(query: str) -> dict[str, Any]:
     if not OPENROUTER_API_KEY:
         return default_result
 
+    context_prefix = ""
+    if has_active_context and recent_history:
+        turns = []
+        for h in recent_history[-2:]:
+            speaker = "User" if h.get("role") == "user" else "Assistant"
+            content = (h.get("content") or "")[:250].replace("\n", " ")
+            turns.append(f"{speaker}: {content}")
+        if turns:
+            context_prefix = (
+                "PREVIOUS CONVERSATION CONTEXT:\n"
+                + "\n".join(turns)
+                + "\n\n"
+                + "If the current query is a conversational follow-up, simplification, clarification, translation, or drill-down on the scenario or statutes ALREADY being discussed above, classify it as FOLLOW_UP.\n\n"
+            )
+
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -218,7 +238,9 @@ def classify_query_intent(query: str) -> dict[str, Any]:
         }
         prompt = (
             "You are a Senior Legal Domain Classifier for Nepal Law (Constitution of Nepal, 2015 and National Criminal Procedure Code, 2017).\n"
-            "Classify the user's query into exactly ONE category:\n\n"
+            + context_prefix
+            + "Classify the user's query into exactly ONE category:\n\n"
+            "- FOLLOW_UP: Conversational follow-up, simplification, translation, or questions referencing the existing scenario/discussion above without needing brand new statutes.\n"
             "- CONSTITUTIONAL_DIRECT: Direct question about the Constitution of Nepal.\n"
             "- CONSTITUTIONAL_SCENARIO: Real-world scenario where Constitutional Fundamental Rights (Part 3) are primary.\n"
             "- STATUTORY_CRIMINAL: Criminal procedural matter (arrest, detention, remand, search, seizure, bail, charge-sheet, trial, evidence, appeal).\n"
@@ -240,7 +262,8 @@ def classify_query_intent(query: str) -> dict[str, Any]:
             json_match = re.search(r'\{.*\}', raw, re.DOTALL)
             if json_match:
                 result = json.loads(json_match.group())
-                if result.get("intent") not in INTENT_CATEGORIES:
+                intent_val = result.get("intent")
+                if intent_val not in INTENT_CATEGORIES or (intent_val == "FOLLOW_UP" and not has_active_context):
                     result["intent"] = "MIXED"
                 return result
     except (json.JSONDecodeError, KeyError, TypeError, requests.RequestException):
@@ -752,6 +775,14 @@ Structure your answer into distinct sections:
 3. **PART C - REMEDIES & ACTIONS**:
    - Court remedies (remand contest, bail application, writ of Habeas Corpus under Article 133/144).
 """,
+
+    "FOLLOW_UP": """
+FOR THIS CONVERSATIONAL FOLLOW-UP / CLARIFICATION:
+- Maintain full conversational continuity with the preceding discussion.
+- Directly address the user's specific request (e.g., simplified breakdown, practical explanation, translation, or scenario question).
+- Stay strictly grounded in the statutory provisions already provided in the active retrieved legal context.
+- Keep the explanation clear, accessible, and responsive to the user's instructions while preserving statutory citation integrity.
+""",
 }
 
 
@@ -860,6 +891,39 @@ def select_or_create_session(user: dict[str, Any]) -> dict[str, Any]:
     return auth_service.create_chat_session(user["id"], title=title, chat_mode=chat_mode)
 
 
+def is_follow_up_heuristic(prompt: str) -> bool:
+    """Fast zero-latency check for common conversational follow-up patterns."""
+    p = prompt.strip().lower()
+
+    # 1. Simplification and explanation directives
+    if re.search(r"\b(in\s+simple\s+terms?|simple\s+terms?|explain\s+simply|in\s+simple\s+words?|simplify|simplification|layman(?:'s)?\s+terms?|make\s+it\s+simple|easy\s+to\s+understand|simply\s+put|plain\s+english|plain\s+terms?)\b", p):
+        return True
+
+    # 2. Meta-inquiry about prior discussion / situation
+    if re.search(r"\b(what\s+do\s+you\s+think\s+about\s+(?:this|that|it|the\s+situation)|what\s+does\s+(?:that|this)\s+mean|why\s+is\s+that|what\s+do\s+you\s+mean|elaborate\s+on\s+(?:this|that)|tell\s+me\s+more\s+about\s+(?:this|that))\b", p):
+        return True
+    if p in {"why?", "why", "how come?", "how come", "how so?", "how so", "explain", "explain please", "elaborate"}:
+        return True
+
+    # 3. Summarization and formatting requests
+    if re.search(r"\b(summarize\s+(?:this|that|the\s+above|it)?|summarise\s+(?:this|that|the\s+above|it)?|in\s+bullet\s+points?|bullet\s+points?|give\s+me\s+a\s+summary|tldr)\b", p):
+        return True
+
+    # 4. Translation requests
+    if re.search(r"\b(translate\s+(?:this|that|it\s+)?(?:to|into)\s+nepali|in\s+nepali|nepali\s+ma|translate\s+(?:this|that|it\s+)?(?:to|into)\s+english)\b", p):
+        return True
+
+    # 5. Drafting assistance based on active discussion
+    if re.search(r"\b((?:draft|write)\s+(?:an?\s+)?(?:application|petition|fir|letter|sample|notice)\s+(?:based\s+on\s+this|for\s+this|for\s+the\s+above|regarding\s+this)?)\b", p):
+        return True
+
+    # 6. Direct referential questions on the active scenario
+    if re.search(r"^(what\s+kinds?\s+of\s+charges|what\s+charges|who\s+will\s+be\s+charged|can\s+he\s+be|will\s+he\s+be|what\s+about\s+the\s+person|what\s+about\s+the\s+accused|what\s+about\s+him|what\s+about\s+her)\b", p):
+        return True
+
+    return False
+
+
 def chat_loop(user: dict[str, Any], session: dict[str, Any]):
     chat_mode = session.get("chat_mode", "all_laws")
     mode_desc = {
@@ -872,10 +936,13 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
     print(f"SESSION: {session['title']}")
     print(f"SCOPE:   {mode_desc}")
     print("Ask any question regarding Nepali constitutional or criminal procedural law.")
-    print("Commands: /history, /sessions, /sources, /upload, /exit")
+    print("Commands: /history, /sessions, /sources, /upload, /reset, /exit")
     print("=" * 70)
 
+    last_combined_context = ""
     last_retrieved_sources = []
+    last_citations_metadata = []
+    last_intent: dict[str, Any] = {}
 
     while True:
         try:
@@ -922,7 +989,18 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
         elif prompt.lower() == "/sessions":
             session = select_or_create_session(user)
             chat_mode = session.get("chat_mode", "all_laws")
+            last_combined_context = ""
+            last_retrieved_sources = []
+            last_citations_metadata = []
+            last_intent = {}
             print(f"\nSwitched to session: {session['title']} (Mode: {chat_mode})\n")
+            continue
+        elif prompt.lower() == "/reset":
+            last_combined_context = ""
+            last_retrieved_sources = []
+            last_citations_metadata = []
+            last_intent = {}
+            print("\n[RESET] Active retrieval context cleared. Next inquiry will perform a fresh search.\n")
             continue
         elif prompt.lower().startswith("/upload"):
             parts = prompt.split(maxsplit=1)
@@ -938,102 +1016,146 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
                     print(f"\n[ERROR] Document upload failed: {e}\n")
             continue
 
-        # 1. Intent Classification
-        print("\n[1/5] Classifying query intent...")
-        intent = classify_query_intent(prompt)
-        intent_type = intent.get("intent", "MIXED")
-        print(f"       Domain: {intent_type}")
-        if intent.get("suggested_provisions"):
-            print(f"       Suggested Provisions: {intent['suggested_provisions']}")
+        # Check for conversational follow-up on active context
+        is_follow_up = False
+        has_active_context = bool(last_combined_context and last_retrieved_sources)
 
-        # 2. Query Decomposition
-        print("[2/5] Decomposing into sub-queries...")
-        sub_queries = decompose_query(prompt, intent)
-        print(f"       Generated {len(sub_queries)} search angles")
-
-        # 3. Two-Tier Multi-Document Retrieval
-        print("[3/5] Retrieving from Two-Tier Supabase Knowledge Base...")
-        doc_filter = None if chat_mode == "all_laws" else chat_mode
-        candidates = retrieve_multi_query(
-            sub_queries,
-            top_k_per_query=10,
-            document_id=doc_filter,
-            user_prompt=prompt,
-            suggested_provisions=intent.get("suggested_provisions", []),
-        )
-        print(f"       Retrieved {len(candidates)} candidate provisions")
-
-        # Expand constitutional cross-references
-        candidates = expand_with_cross_references(candidates, intent)
-
-        # 4. Scenario-Aware Reranking (with Statutory & Constitutional Quota)
-        print("[4/5] Reranking candidates...")
-        reranked = rerank_candidates(prompt, candidates, intent, top_k=8)
-        print(f"       Top {len(reranked)} provisions selected")
-
-        # Hydrate full parent text
-        hydrated = hydrate_parent_context(reranked)
-        last_retrieved_sources = hydrated
-
-        # 5. Domain-Aware Dynamic Prompt Assembly
-        print("[5/5] Assembling statutory & constitutional prompt...")
-        context_blocks = []
-        citations_metadata = []
-
-        for doc in hydrated:
-            doc_name = doc.get("document_title") or doc.get("document_id", "Nepal Law")
-            ref_name = doc.get("structural_ref") or doc.get("title", "")
-            parent_title = doc.get("parent_title", "")
-            parent_num = doc.get("parent_number")
-            page_num = doc.get("page")
-            content = doc.get("content", "")
-            if doc.get("is_cross_ref"):
-                scope = doc.get("ref_scope", "INTRA_DOCUMENT")
-                scope_label = (
-                    "=== [CROSS-DOCUMENT REFERENCE: CITED ACROSS DIFFERENT LEGISLATION] ==="
-                    if scope == "CROSS_DOCUMENT"
-                    else "=== [INTRA-DOCUMENT REFERENCE: CITED WITHIN THE SAME ACT] ==="
-                )
-                rel_desc = doc.get("relationship_description") or doc.get("relationship_label") or "Referred statutory provision"
-                block = (
-                    f"--- SOURCE: {doc_name} | {ref_name} ---\n"
-                    f"{scope_label}\n"
-                    f"LEGAL RELATIONSHIP: {rel_desc}\n"
-                    f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
-                    f"{content}\n"
-                )
-            else:
-                block = (
-                    f"--- SOURCE: {doc_name} | {ref_name} [PRIMARY GOVERNING PROVISION] ---\n"
-                    f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
-                    f"{content}\n"
-                )
-            context_blocks.append(block)
-
-            citations_metadata.append({
-                "document_id": doc.get("document_id"),
-                "document_title": doc_name,
-                "structural_ref": ref_name,
-                "unit_number": doc.get("unit_number"),
-                "page": page_num,
-                "title": doc.get("title"),
-                "is_cross_ref": doc.get("is_cross_ref", False),
-                "ref_scope": doc.get("ref_scope", "INTRA_DOCUMENT"),
-                "relationship_description": doc.get("relationship_description", ""),
-            })
-
-        combined_context = "\n".join(context_blocks)
-        system_prompt = build_system_prompt(intent)
-
-        # Multi-turn history
         history = auth_service.get_chat_history(session["id"], user["id"])
         recent_history = history[-6:]
+
+        if has_active_context and recent_history:
+            if is_follow_up_heuristic(prompt):
+                is_follow_up = True
+                intent = {
+                    "intent": "FOLLOW_UP",
+                    "reasoning": "Conversational follow-up on active legal context",
+                    "suggested_provisions": [],
+                }
+                print("\n[Conversational Mode] Reusing active statutory context (zero retrieval delay)...")
+
+        if not is_follow_up:
+            # 1. Intent Classification (with multi-turn context awareness)
+            print("\n[1/5] Classifying query intent...")
+            intent = classify_query_intent(
+                prompt,
+                recent_history=recent_history if has_active_context else None,
+                has_active_context=has_active_context,
+            )
+            intent_type = intent.get("intent", "MIXED")
+
+            if intent_type == "FOLLOW_UP" and has_active_context:
+                is_follow_up = True
+                print("       Domain: FOLLOW_UP (Referencing active discussion)")
+                print("       [Conversational Mode] Reusing active statutory context (zero retrieval delay)...")
+            else:
+                print(f"       Domain: {intent_type}")
+                if intent.get("suggested_provisions"):
+                    print(f"       Suggested Provisions: {intent['suggested_provisions']}")
+
+        if not is_follow_up:
+            # 2. Query Decomposition
+            print("[2/5] Decomposing into sub-queries...")
+            sub_queries = decompose_query(prompt, intent)
+            print(f"       Generated {len(sub_queries)} search angles")
+
+            # 3. Two-Tier Multi-Document Retrieval
+            print("[3/5] Retrieving from Two-Tier Supabase Knowledge Base...")
+            doc_filter = None if chat_mode == "all_laws" else chat_mode
+            candidates = retrieve_multi_query(
+                sub_queries,
+                top_k_per_query=10,
+                document_id=doc_filter,
+                user_prompt=prompt,
+                suggested_provisions=intent.get("suggested_provisions", []),
+            )
+            print(f"       Retrieved {len(candidates)} candidate provisions")
+
+            # Expand constitutional cross-references
+            candidates = expand_with_cross_references(candidates, intent)
+
+            # 4. Scenario-Aware Reranking (with Statutory & Constitutional Quota)
+            print("[4/5] Reranking candidates...")
+            reranked = rerank_candidates(prompt, candidates, intent, top_k=8)
+            print(f"       Top {len(reranked)} provisions selected")
+
+            # Hydrate full parent text
+            hydrated = hydrate_parent_context(reranked)
+            last_retrieved_sources = hydrated
+
+            # 5. Domain-Aware Dynamic Prompt Assembly
+            print("[5/5] Assembling statutory & constitutional prompt...")
+            context_blocks = []
+            citations_metadata = []
+
+            for doc in hydrated:
+                doc_name = doc.get("document_title") or doc.get("document_id", "Nepal Law")
+                ref_name = doc.get("structural_ref") or doc.get("title", "")
+                parent_title = doc.get("parent_title", "")
+                parent_num = doc.get("parent_number")
+                page_num = doc.get("page")
+                content = doc.get("content", "")
+                if doc.get("is_cross_ref"):
+                    scope = doc.get("ref_scope", "INTRA_DOCUMENT")
+                    scope_label = (
+                        "=== [CROSS-DOCUMENT REFERENCE: CITED ACROSS DIFFERENT LEGISLATION] ==="
+                        if scope == "CROSS_DOCUMENT"
+                        else "=== [INTRA-DOCUMENT REFERENCE: CITED WITHIN THE SAME ACT] ==="
+                    )
+                    rel_desc = doc.get("relationship_description") or doc.get("relationship_label") or "Referred statutory provision"
+                    block = (
+                        f"--- SOURCE: {doc_name} | {ref_name} ---\n"
+                        f"{scope_label}\n"
+                        f"LEGAL RELATIONSHIP: {rel_desc}\n"
+                        f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
+                        f"{content}\n"
+                    )
+                else:
+                    block = (
+                        f"--- SOURCE: {doc_name} | {ref_name} [PRIMARY GOVERNING PROVISION] ---\n"
+                        f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
+                        f"{content}\n"
+                    )
+                context_blocks.append(block)
+
+                citations_metadata.append({
+                    "document_id": doc.get("document_id"),
+                    "document_title": doc_name,
+                    "structural_ref": ref_name,
+                    "unit_number": doc.get("unit_number"),
+                    "page": page_num,
+                    "title": doc.get("title"),
+                    "is_cross_ref": doc.get("is_cross_ref", False),
+                    "ref_scope": doc.get("ref_scope", "INTRA_DOCUMENT"),
+                    "relationship_description": doc.get("relationship_description", ""),
+                })
+
+            combined_context = "\n".join(context_blocks)
+            last_combined_context = combined_context
+            last_citations_metadata = citations_metadata
+            last_intent = intent
+        else:
+            combined_context = last_combined_context
+            citations_metadata = last_citations_metadata
+
+        intent_for_prompt = intent if intent.get("intent") != "FOLLOW_UP" else (last_intent or intent)
+        system_prompt = build_system_prompt(intent_for_prompt)
 
         messages = [{"role": "system", "content": system_prompt}]
         for h in recent_history:
             messages.append({"role": h["role"], "content": h["content"]})
 
-        user_turn_content = f"""QUERY INTENT: {intent_type}
+        if is_follow_up:
+            user_turn_content = f"""CONVERSATIONAL MODE: Follow-up question / clarification on the active legal scenario.
+
+ACTIVE RETRIEVED LEGAL CONTEXT (CONSTITUTION & STATUTES):
+{combined_context}
+
+USER FOLLOW-UP / INSTRUCTION:
+{prompt}
+
+Please answer the user's follow-up directly, keeping consistency with the previous analysis and grounding your response in the active statutory context above."""
+        else:
+            user_turn_content = f"""QUERY INTENT: {intent.get('intent', 'MIXED')}
 {f"ANALYSIS FOCUS: {intent.get('reasoning', '')}" if intent.get('reasoning') else ""}
 
 RETRIEVED LEGAL CONTEXT (CONSTITUTION & STATUTES):
