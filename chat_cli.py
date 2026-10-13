@@ -90,44 +90,100 @@ def get_rerank_model():
     return _RERANK_MODEL
 
 
-def get_article_graph() -> dict[str, list[int]]:
-    """Load the constitutional article cross-reference graph from Supabase (with disk fallback)."""
-    global _ARTICLE_GRAPH
-    if _ARTICLE_GRAPH is not None:
-        return _ARTICLE_GRAPH
+_CLOUD_CITATION_GRAPH: dict[tuple[str, int], list[dict[str, Any]]] | None = None
 
-    # 1. Try loading directly from Supabase cloud
+
+def get_cloud_citation_graph() -> dict[tuple[str, int], list[dict[str, Any]]]:
+    """Load universal multi-act citation graph from Supabase (100% cloud-native)."""
+    global _CLOUD_CITATION_GRAPH
+    if _CLOUD_CITATION_GRAPH is not None:
+        return _CLOUD_CITATION_GRAPH
+
+    # 1. Direct query to Supabase knowledge.citation_edges table
     try:
         conn = auth_service.get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT source_unit_number, target_unit_number 
-                FROM knowledge.citation_edges 
-                WHERE source_document_id = 'constitution'
-                ORDER BY source_unit_number, target_unit_number;
+                SELECT source_document_id, source_unit_number,
+                       target_document_id, target_unit_number,
+                       relation_type, metadata
+                FROM knowledge.citation_edges
+                ORDER BY source_document_id, source_unit_number;
             """)
             rows = cur.fetchall()
         conn.close()
 
         if rows:
-            graph: dict[str, list[int]] = {}
-            for src, tgt in rows:
-                graph.setdefault(str(src), []).append(tgt)
-            _ARTICLE_GRAPH = graph
-            return _ARTICLE_GRAPH
-    except Exception:
-        pass
+            graph: dict[tuple[str, int], list[dict[str, Any]]] = {}
+            for src_doc, src_unit, tgt_doc, tgt_unit, rel, meta in rows:
+                key = (src_doc, int(src_unit))
+                graph.setdefault(key, []).append({
+                    "target_document_id": tgt_doc,
+                    "target_unit_number": int(tgt_unit),
+                    "relation_type": rel,
+                    "metadata": meta if isinstance(meta, dict) else {},
+                })
+            _CLOUD_CITATION_GRAPH = graph
+            return _CLOUD_CITATION_GRAPH
+    except Exception as e:
+        print(f"  [WARN] Failed to load citation edges from Supabase: {e}")
 
-    # 2. Local fallback if DB is unreachable and local file exists
+    # 2. Local fallback if DB is completely unreachable
+    fallback_graph: dict[tuple[str, int], list[dict[str, Any]]] = {}
     if ARTICLE_GRAPH_PATH.exists():
         try:
-            _ARTICLE_GRAPH = json.loads(ARTICLE_GRAPH_PATH.read_text(encoding="utf-8"))
-            return _ARTICLE_GRAPH
+            raw = json.loads(ARTICLE_GRAPH_PATH.read_text(encoding="utf-8"))
+            for src, targets in raw.items():
+                items = targets.get("articles", []) if isinstance(targets, dict) else targets
+                meta = {k: v for k, v in targets.items() if k != "articles"} if isinstance(targets, dict) else {}
+                for tgt in items:
+                    fallback_graph.setdefault(("constitution", int(src)), []).append({
+                        "target_document_id": "constitution",
+                        "target_unit_number": int(tgt),
+                        "relation_type": "refers_to_article",
+                        "metadata": meta,
+                    })
         except Exception:
             pass
 
-    _ARTICLE_GRAPH = {}
-    return _ARTICLE_GRAPH
+    act_graph_path = CRIMINAL_PROC_DIR / "act_graph.json"
+    if act_graph_path.exists():
+        try:
+            raw = json.loads(act_graph_path.read_text(encoding="utf-8"))
+            for src, targets in raw.items():
+                secs = targets.get("sections", []) if isinstance(targets, dict) else targets
+                meta = {k: v for k, v in targets.items() if k != "sections"} if isinstance(targets, dict) else {}
+                for tgt in secs:
+                    fallback_graph.setdefault(("criminal_procedure", int(src)), []).append({
+                        "target_document_id": "criminal_procedure",
+                        "target_unit_number": int(tgt),
+                        "relation_type": "refers_to_section",
+                        "metadata": meta,
+                    })
+                for tgt in targets.get("constitution_articles", []) if isinstance(targets, dict) else []:
+                    fallback_graph.setdefault(("criminal_procedure", int(src)), []).append({
+                        "target_document_id": "constitution",
+                        "target_unit_number": int(tgt),
+                        "relation_type": "cites_constitutional_article",
+                        "metadata": meta,
+                    })
+        except Exception:
+            pass
+
+    _CLOUD_CITATION_GRAPH = fallback_graph
+    return _CLOUD_CITATION_GRAPH
+
+
+def get_article_graph() -> dict[str, list[int]]:
+    """Legacy compatibility helper: returns constitution-only graph {art_str: [targets]}."""
+    cloud_graph = get_cloud_citation_graph()
+    result: dict[str, list[int]] = {}
+    for (doc, src_unit), edges in cloud_graph.items():
+        if doc == "constitution":
+            targets = [e["target_unit_number"] for e in edges if e["target_document_id"] == "constitution"]
+            if targets:
+                result[str(src_unit)] = targets
+    return result
 
 
 # ============================================================================
@@ -418,34 +474,36 @@ def retrieve_multi_query(
 
 
 def expand_with_cross_references(candidates: list[dict[str, Any]], intent: dict[str, Any]) -> list[dict[str, Any]]:
-    """Expand retrieved Constitutional provisions with their cross-referenced articles."""
-    graph = get_article_graph()
+    """Expand retrieved provisions across all Acts using the Supabase cloud citation graph."""
+    graph = get_cloud_citation_graph()
     if not graph:
         return candidates
 
-    retrieved_articles = set()
+    retrieved_provisions = set()
     for c in candidates:
-        if c.get("document_id") == "constitution":
-            art_num = c.get("unit_number")
-            if art_num:
-                retrieved_articles.add(art_num)
+        doc_id = c.get("document_id")
+        unit_num = c.get("unit_number")
+        if doc_id and unit_num is not None:
+            retrieved_provisions.add((doc_id, int(unit_num)))
 
-    articles_to_fetch = set()
-    for art in retrieved_articles:
-        neighbors = graph.get(str(art), [])
-        for neighbor in neighbors[:2]:
-            if neighbor not in retrieved_articles:
-                articles_to_fetch.add(neighbor)
+    # Collect missing target provisions to fetch
+    targets_to_fetch: dict[tuple[str, int], dict[str, Any]] = {}
+    for (doc_id, unit_num) in list(retrieved_provisions):
+        edges = graph.get((doc_id, unit_num), [])
+        for edge in edges[:3]:  # Top cross-references
+            tgt_key = (edge["target_document_id"], edge["target_unit_number"])
+            if tgt_key not in retrieved_provisions and tgt_key not in targets_to_fetch:
+                targets_to_fetch[tgt_key] = edge
 
-    if not articles_to_fetch:
+    if not targets_to_fetch:
         return candidates
 
     conn = auth_service.get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        placeholders = ",".join(["%s"] * len(articles_to_fetch))
-        sql = f"""
-            SELECT DISTINCT ON (c.unit_number)
+        pairs = list(targets_to_fetch.keys())
+        sql = """
+            SELECT DISTINCT ON (c.document_id, c.unit_number)
                 c.id, c.document_id, d.title AS document_title, d.doc_category,
                 c.file_path, c.chunk_index, c.doc_type, c.structural_ref,
                 c.title, c.content, c.parent_number, c.parent_title,
@@ -453,20 +511,23 @@ def expand_with_cross_references(candidates: list[dict[str, Any]], intent: dict[
                 c.proviso_count, c.tags
             FROM knowledge.document_chunks c
             JOIN knowledge.documents d ON c.document_id = d.id
-            WHERE c.document_id = 'constitution' AND c.unit_number IN ({placeholders})
-            ORDER BY c.unit_number, c.chunk_index;
+            WHERE (c.document_id, c.unit_number) IN %s
+            ORDER BY c.document_id, c.unit_number, c.chunk_index;
         """
-        cur.execute(sql, list(articles_to_fetch))
+        cur.execute(sql, (tuple(pairs),))
         cross_ref_rows = cur.fetchall()
 
         for row in cross_ref_rows:
             entry = dict(row)
+            edge_info = targets_to_fetch.get((entry["document_id"], entry["unit_number"]), {})
             entry["rrf_score"] = 0.005
             entry["retrieval_count"] = 0
             entry["is_cross_ref"] = True
+            entry["cross_ref_relation"] = edge_info.get("relation_type", "refers_to")
+            entry["citation_metadata"] = edge_info.get("metadata", {})
             candidates.append(entry)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [CROSS-REF EXPANSION ERROR] {e}")
     finally:
         cur.close()
         conn.close()
@@ -630,8 +691,10 @@ STRICT LEGAL CITATION RULES:
 1. CITATION NOTATION:
    - For Constitution: Cite as "Article {N}({clause}) (Constitution of Nepal, Part {P}, Page {Page})" (e.g., "Article 20(3) (Page 11)").
    - For Criminal Procedure: Cite as "Section {N}({sub-section}) (National Criminal Procedure Code, Chapter {C}, Page {Page})" (e.g., "Section 14(1) (Page 20)").
-2. GROUNDING: Cite only provisions supported by the retrieved statutory and constitutional context.
-3. CLEAR SEPARATION: Explicitly distinguish between constitutional fundamental rights and statutory procedural requirements.
+2. STRICT GROUNDING: Base all legal findings, timeframes, and procedural steps directly on the retrieved text. Never extrapolate, contradict, or invent legal rules not supported by the retrieved statutory context.
+3. FIDELITY TO STATUTORY WORDING: Preserve exact legal thresholds (e.g., 24-hour court presentation, sunrise-to-sunset search limitations, mandatory deeds/witnesses).
+4. NESTED LAW SYNTHESIS: When cross-referenced provisions or statutory schedules are provided in context, synthesize them as a coherent legal chain (e.g., explain how the Section connects to the Schedule form or Constitutional Article) without diluting the primary rule.
+5. CLEAR SEPARATION: Explicitly distinguish between constitutional fundamental rights and statutory procedural requirements.
 """
 
 DOMAIN_INSTRUCTIONS = {
@@ -1016,9 +1079,10 @@ def handle_signup() -> dict[str, Any] | None:
 def main():
     print_banner()
 
-    graph = get_article_graph()
+    graph = get_cloud_citation_graph()
     if graph:
-        print(f"[INIT] Constitution cross-reference graph loaded: {len(graph)} articles")
+        total_edges = sum(len(v) for v in graph.values())
+        print(f"[INIT] Cloud citation graph loaded from Supabase: {total_edges} edges across {len(graph)} source provisions")
 
     current_user = None
     while current_user is None:
