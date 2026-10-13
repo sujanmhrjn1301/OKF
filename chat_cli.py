@@ -493,7 +493,10 @@ def expand_with_cross_references(candidates: list[dict[str, Any]], intent: dict[
         for edge in edges[:3]:  # Top cross-references
             tgt_key = (edge["target_document_id"], edge["target_unit_number"])
             if tgt_key not in retrieved_provisions and tgt_key not in targets_to_fetch:
-                targets_to_fetch[tgt_key] = edge
+                edge_with_src = dict(edge)
+                edge_with_src["source_document_id"] = doc_id
+                edge_with_src["source_unit_number"] = unit_num
+                targets_to_fetch[tgt_key] = edge_with_src
 
     if not targets_to_fetch:
         return candidates
@@ -520,11 +523,20 @@ def expand_with_cross_references(candidates: list[dict[str, Any]], intent: dict[
         for row in cross_ref_rows:
             entry = dict(row)
             edge_info = targets_to_fetch.get((entry["document_id"], entry["unit_number"]), {})
+            edge_meta = edge_info.get("metadata", {})
+            src_doc = edge_info.get("source_document_id")
+            tgt_doc = entry.get("document_id")
+
             entry["rrf_score"] = 0.005
             entry["retrieval_count"] = 0
             entry["is_cross_ref"] = True
             entry["cross_ref_relation"] = edge_info.get("relation_type", "refers_to")
-            entry["citation_metadata"] = edge_info.get("metadata", {})
+            entry["citation_metadata"] = edge_meta
+            entry["ref_scope"] = edge_meta.get("scope", "CROSS_DOCUMENT" if src_doc != tgt_doc else "INTRA_DOCUMENT")
+            entry["relationship_label"] = edge_meta.get("relationship_label", "")
+            entry["relationship_description"] = edge_meta.get("relationship_description", "")
+            entry["cited_by_doc"] = edge_meta.get("source_document_title", src_doc or "")
+            entry["cited_by_unit"] = edge_info.get("source_unit_number")
             candidates.append(entry)
     except Exception as e:
         print(f"  [CROSS-REF EXPANSION ERROR] {e}")
@@ -695,6 +707,10 @@ STRICT LEGAL CITATION RULES:
 3. FIDELITY TO STATUTORY WORDING: Preserve exact legal thresholds (e.g., 24-hour court presentation, sunrise-to-sunset search limitations, mandatory deeds/witnesses).
 4. NESTED LAW SYNTHESIS: When cross-referenced provisions or statutory schedules are provided in context, synthesize them as a coherent legal chain (e.g., explain how the Section connects to the Schedule form or Constitutional Article) without diluting the primary rule.
 5. CLEAR SEPARATION: Explicitly distinguish between constitutional fundamental rights and statutory procedural requirements.
+6. EXPLICIT STATUTORY ATTRIBUTION (INTRA vs CROSS-DOCUMENT):
+   - You must make the relationship and statutory origin 100% explicit. Clarify whether a referenced provision is within the SAME document or a DIFFERENT Act/Constitution.
+   - If INTRA-DOCUMENT: Explicitly state that it refers to a provision within the same Act (e.g., "Section 18 refers to Section 16(5) within the Criminal Procedure Code").
+   - If CROSS-DOCUMENT: Explicitly name the exact foreign legislation, article/section, and clause (e.g., "Section 96 refers to Article 134(1) of the Constitution of Nepal", or "Article 28 refers to Section X, Clause Y of the Privacy Act"). Never cite a cross-referenced section without naming its governing Act.
 """
 
 DOMAIN_INSTRUCTIONS = {
@@ -894,8 +910,17 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
                 for s in last_retrieved_sources:
                     doc = s.get("document_title") or s.get("document_id", "")
                     ref = s.get("structural_ref") or s.get("title", "")
-                    xref = " [CROSS-REF]" if s.get("is_cross_ref") else ""
-                    print(f"- {doc} | {ref}: {s.get('title')} (Page {s.get('page')}){xref}")
+                    title = s.get("title") or ""
+                    page = s.get("page")
+                    if s.get("is_cross_ref"):
+                        scope = s.get("ref_scope", "INTRA_DOCUMENT")
+                        tag = "[CROSS-DOCUMENT REF]" if scope == "CROSS_DOCUMENT" else "[INTRA-DOCUMENT REF]"
+                        rel_info = s.get("relationship_description") or s.get("relationship_label") or ""
+                        print(f"  {tag} {doc} | {ref}: {title} (Page {page})")
+                        if rel_info:
+                            print(f"     └─ Relation: {rel_info}")
+                    else:
+                        print(f"  [PRIMARY GOVERNING] {doc} | {ref}: {title} (Page {page})")
                 print("------------------------------------------\n")
             continue
         elif prompt.lower() == "/sessions":
@@ -953,13 +978,27 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
             parent_num = doc.get("parent_number")
             page_num = doc.get("page")
             content = doc.get("content", "")
-            xref_tag = " [Cross-Referenced]" if doc.get("is_cross_ref") else ""
-
-            block = (
-                f"--- SOURCE: {doc_name} | {ref_name}{xref_tag} ---\n"
-                f"Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
-                f"{content}\n"
-            )
+            if doc.get("is_cross_ref"):
+                scope = doc.get("ref_scope", "INTRA_DOCUMENT")
+                scope_label = (
+                    "=== [CROSS-DOCUMENT REFERENCE: CITED ACROSS DIFFERENT LEGISLATION] ==="
+                    if scope == "CROSS_DOCUMENT"
+                    else "=== [INTRA-DOCUMENT REFERENCE: CITED WITHIN THE SAME ACT] ==="
+                )
+                rel_desc = doc.get("relationship_description") or doc.get("relationship_label") or "Referred statutory provision"
+                block = (
+                    f"--- SOURCE: {doc_name} | {ref_name} ---\n"
+                    f"{scope_label}\n"
+                    f"LEGAL RELATIONSHIP: {rel_desc}\n"
+                    f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
+                    f"{content}\n"
+                )
+            else:
+                block = (
+                    f"--- SOURCE: {doc_name} | {ref_name} [PRIMARY GOVERNING PROVISION] ---\n"
+                    f"Governing Act: {doc_name} | Chapter/Part: {parent_title} (No. {parent_num}) | Citation: {ref_name} | Page: {page_num}\n"
+                    f"{content}\n"
+                )
             context_blocks.append(block)
 
             citations_metadata.append({
@@ -970,6 +1009,8 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
                 "page": page_num,
                 "title": doc.get("title"),
                 "is_cross_ref": doc.get("is_cross_ref", False),
+                "ref_scope": doc.get("ref_scope", "INTRA_DOCUMENT"),
+                "relationship_description": doc.get("relationship_description", ""),
             })
 
         combined_context = "\n".join(context_blocks)

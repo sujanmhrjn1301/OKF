@@ -81,14 +81,55 @@ def upload_graph_edges(conn, graph: dict, source_doc: str = "constitution", targ
                 rows.append((source_doc, src_num, target_doc, int(tgt_num), "refers_to", "{}"))
             continue
 
+        DOC_TITLES = {
+            "constitution": "The Constitution of Nepal, 2015",
+            "criminal_procedure": "The National Criminal Procedure (Code) Act, 2017",
+        }
+        source_title = DOC_TITLES.get(source_doc, source_doc)
         detail = {k: v for k, v in targets.items() if k not in ("articles", "sections", "constitution_articles")}
-        meta = json.dumps(detail) if detail else "{}"
+
         same_doc_key = "articles" if source_doc == "constitution" else "sections"
         for tgt_num in targets.get(same_doc_key, []):
             rel = "refers_to_article" if same_doc_key == "articles" else "refers_to_section"
-            rows.append((source_doc, src_num, target_doc, int(tgt_num), rel, meta))
+            pinpoints = []
+            if source_doc == "constitution":
+                pinpoints = [c for c in targets.get("article_clauses", []) if c.startswith(f"{tgt_num}(")]
+            else:
+                pinpoints = [s for s in targets.get("section_subsections", []) if s.startswith(f"{tgt_num}(")]
+
+            unit_label = "Article" if source_doc == "constitution" else "Section"
+            pinpoint_str = f" ({pinpoints[0]})" if pinpoints else ""
+            edge_meta = {
+                "scope": "INTRA_DOCUMENT",
+                "source_document_title": source_title,
+                "target_document_title": source_title,
+                "relationship_label": f"{unit_label} {src_num} -> {unit_label} {tgt_num}{pinpoint_str} (Within Same Document)",
+                "relationship_description": f"{unit_label} {src_num} refers internally within {source_title} to {unit_label} {tgt_num}{pinpoint_str}",
+                "pinpoint": pinpoints,
+            }
+            for k, v in detail.items():
+                if k not in edge_meta:
+                    edge_meta[k] = v
+
+            rows.append((source_doc, src_num, target_doc, int(tgt_num), rel, json.dumps(edge_meta)))
+
         for tgt_num in targets.get("constitution_articles", []):
-            rows.append((source_doc, src_num, "constitution", int(tgt_num), "cites_constitutional_article", meta))
+            target_title = DOC_TITLES.get("constitution", "The Constitution of Nepal, 2015")
+            const_pinpoints = [c for c in targets.get("constitution_article_clauses", []) if c.startswith(f"{tgt_num}(")]
+            pinpoint_str = f" ({const_pinpoints[0]})" if const_pinpoints else ""
+            edge_meta = {
+                "scope": "CROSS_DOCUMENT",
+                "source_document_title": source_title,
+                "target_document_title": target_title,
+                "relationship_label": f"Section {src_num} ({source_title}) -> Article {tgt_num}{pinpoint_str} ({target_title}) [Cross-Act Citation]",
+                "relationship_description": f"Section {src_num} of {source_title} refers across legislation to Article {tgt_num}{pinpoint_str} of {target_title}",
+                "pinpoint": const_pinpoints,
+            }
+            for k, v in detail.items():
+                if k not in edge_meta:
+                    edge_meta[k] = v
+
+            rows.append((source_doc, src_num, "constitution", int(tgt_num), "cites_constitutional_article", json.dumps(edge_meta)))
 
     if not rows:
         print("[MIGRATION] No edges to upload.")

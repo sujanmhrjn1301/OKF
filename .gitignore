@@ -37,3 +37,9 @@ tmp/
 build/
 dist/
 *.egg-info/
+
+agents.md
+questions.md
+security.md
+train.jsonl
+val.jsonl
