@@ -230,19 +230,36 @@ CREATE TABLE IF NOT EXISTS user_vault.user_document_chunks (
     page_number INTEGER,
     content TEXT NOT NULL,
     metadata JSONB DEFAULT '{}'::jsonb,
-    embedding VECTOR(384),
+    embedding VECTOR(1536),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_chunks_user_id ON user_vault.user_document_chunks(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_chunks_doc_id ON user_vault.user_document_chunks(document_id);
 
+-- User-to-User Isolated Legal Citation Graph Table
+CREATE TABLE IF NOT EXISTS user_vault.user_citation_edges (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES app_users.users(id) ON DELETE CASCADE,
+    document_id UUID NOT NULL REFERENCES user_vault.user_documents(id) ON DELETE CASCADE,
+    source_unit_number INTEGER NOT NULL,
+    target_document_id TEXT NOT NULL,
+    target_unit_number INTEGER,
+    relation_type VARCHAR(50) NOT NULL DEFAULT 'refers_to_section',
+    scope VARCHAR(50) NOT NULL DEFAULT 'INTRA_DOCUMENT',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_citation_edges_user ON user_vault.user_citation_edges(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_citation_edges_lookup ON user_vault.user_citation_edges(user_id, document_id, source_unit_number);
+
 -- Isolated search function for a specific user and optionally a specific PDF
 CREATE OR REPLACE FUNCTION user_vault.match_user_document_chunks(
     p_user_id UUID,
-    p_query_embedding VECTOR(384),
+    p_query_embedding VECTOR(1536),
     p_document_id UUID DEFAULT NULL,
-    p_match_threshold FLOAT DEFAULT 0.3,
+    p_match_threshold FLOAT DEFAULT 0.25,
     p_match_count INT DEFAULT 10
 )
 RETURNS TABLE (

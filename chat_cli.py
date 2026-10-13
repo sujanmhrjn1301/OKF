@@ -872,7 +872,7 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
     print(f"SESSION: {session['title']}")
     print(f"SCOPE:   {mode_desc}")
     print("Ask any question regarding Nepali constitutional or criminal procedural law.")
-    print("Commands: /history, /sessions, /sources, /exit")
+    print("Commands: /history, /sessions, /sources, /upload, /exit")
     print("=" * 70)
 
     last_retrieved_sources = []
@@ -923,6 +923,19 @@ def chat_loop(user: dict[str, Any], session: dict[str, Any]):
             session = select_or_create_session(user)
             chat_mode = session.get("chat_mode", "all_laws")
             print(f"\nSwitched to session: {session['title']} (Mode: {chat_mode})\n")
+            continue
+        elif prompt.lower().startswith("/upload"):
+            parts = prompt.split(maxsplit=1)
+            if len(parts) < 2:
+                path_str = input("Enter path to PDF document to upload: ").strip()
+            else:
+                path_str = parts[1].strip().strip('"').strip("'")
+            if path_str:
+                try:
+                    import document_uploader
+                    document_uploader.upload_legal_document(path_str, user_id=user["id"])
+                except Exception as e:
+                    print(f"\n[ERROR] Document upload failed: {e}\n")
             continue
 
         # 1. Intent Classification
